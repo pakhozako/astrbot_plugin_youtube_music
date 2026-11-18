@@ -1,0 +1,39 @@
+* text=auto
+*.py text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+/LICENSE text eol=lf
+core/vendor/yt-dlp-public.key text eol=lf
+
+/tests export-ignore
+/frontend export-ignore
+/scripts export-ignore
+/docs/DEVELOPMENT.md export-ignore
+/.github export-ignore
+/CONTRIBUTING.md export-ignore
+/SECURITY.md export-ignore
+/node_modules export-ignore
+/.verification export-ignore
+/.venv export-ignore
+/.ruff_cache export-ignore
+/data export-ignore
+/dist export-ignore
+/test-results export-ignore
+/playwright-report export-ignore
+/BUILD-*.md export-ignore
+/WEBUI-M3-*.md export-ignore
+/MIGRATION-ACCEPTANCE-*.md export-ignore
+/requirements-dev.txt export-ignore
+/package.json export-ignore
+/package-lock.json export-ignore
+/playwright.config.mjs export-ignore
+/ruff.toml export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore

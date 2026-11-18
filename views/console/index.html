@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube 点歌</title>
+  <link rel="stylesheet" href="./app.css">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <a class="skip-link" href="#search-heading" data-i18n="skipContent">跳至内容</a>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-icon" data-icon="Play" aria-hidden="true"></span>
+      <h1 data-i18n="brand">YouTube 点歌</h1>
+      <span id="preview-badge" data-i18n="preview" hidden>模拟预览</span>
+    </div>
+    <div class="header-controls">
+      <div class="session-control">
+        <label for="session" data-i18n="session">目标会话</label>
+        <select id="session" disabled><option value="">加载中</option></select>
+      </div>
+      <span id="connection" role="status">连接中</span>
+      <button id="refresh" type="button" class="icon-button" aria-label="刷新" data-i18n-label="refresh" title="刷新"><span data-icon="RefreshCw"></span></button>
+    </div>
+  </header>
+  <nav class="tabs" aria-label="主导航" data-i18n-label="navigation">
+    <div class="nav-caption" data-i18n="music">音乐</div>
+    <button type="button" data-view="search" aria-current="page"><span class="nav-icon" data-icon="Search"></span><span data-i18n="search">点歌</span></button>
+    <button type="button" data-view="queue"><span class="nav-icon" data-icon="ListMusic"></span><span data-i18n="queue">队列</span><span id="queue-count">0</span></button>
+    <button type="button" data-view="library"><span class="nav-icon" data-icon="Heart"></span><span data-i18n="library">音乐库</span></button>
+    <button type="button" data-view="maintenance"><span class="nav-icon" data-icon="Wrench"></span><span data-i18n="maintenance">维护</span></button>
+    <div class="nav-footer"><span data-icon="Music2"></span><span>YouTube Music</span></div>
+  </nav>
+  <div class="content-shell">
+    <div id="error" class="error-banner" role="alert" hidden>
+      <span data-icon="CircleAlert"></span><span id="error-text"></span>
+      <button id="dismiss-error" type="button" class="icon-button" aria-label="关闭" title="关闭" data-i18n-label="close"><span data-icon="X"></span></button>
+    </div>
+    <main class="workspace" data-view="search">
+      <div class="main-pane">
+        <section id="search-view">
+          <div class="section-heading">
+            <h2 id="search-heading" tabindex="-1" data-i18n="findMusic">搜索音乐</h2>
+            <span id="duration-limit" class="meta-label"></span>
+          </div>
+          <form id="search-form" role="search">
+            <span class="search-icon" data-icon="Search"></span>
+            <label class="sr-only" for="query" data-i18n="query">歌曲、艺人或 YouTube 视频链接</label>
+            <input id="query" type="search" maxlength="2048" autocomplete="off" placeholder="歌曲、艺人或 YouTube 视频链接">
+            <button id="search-button" class="primary" type="submit"><span data-i18n="searchCommand">搜索</span></button>
+          </form>
+          <div class="list-heading"><h3 data-i18n="results">搜索结果</h3><span id="result-count" class="count-badge"></span></div>
+          <ul id="results" class="track-list"></ul>
+        </section>
+        <section id="library-view" hidden>
+          <div class="section-heading">
+            <h2 id="library-heading-page" tabindex="-1" data-i18n="myLibrary">我的音乐</h2>
+            <button id="library-refresh" type="button" class="icon-button" aria-label="刷新音乐库" title="刷新音乐库" data-i18n-label="refreshLibrary"><span data-icon="RefreshCw"></span></button>
+          </div>
+          <div class="library-controls">
+            <div class="segmented" role="group" aria-label="音乐库视图" data-i18n-label="libraryViews">
+              <button type="button" data-library="favorites" aria-pressed="true"><span data-icon="Heart"></span><span data-i18n="favorites">收藏</span></button>
+              <button type="button" data-library="history" aria-pressed="false"><span data-icon="History"></span><span data-i18n="history">历史</span></button>
+            </div>
+            <div class="library-filter-control">
+              <label class="sr-only" for="library-filter" data-i18n="filterLibrary">筛选歌曲或艺人</label>
+              <input id="library-filter" type="search" maxlength="256" placeholder="筛选歌曲或艺人">
+            </div>
+            <select id="library-sort" aria-label="排序" data-i18n-label="sort">
+              <option id="library-sort-recent" value="recent" data-i18n="recent">最近添加</option>
+              <option value="title" data-i18n="sortTitle">歌曲名称</option>
+              <option value="artist" data-i18n="sortArtist">艺人名称</option>
+              <option value="duration" data-i18n="sortDuration">时长升序</option>
+              <option id="library-sort-plays" value="plays" data-i18n="sortPlays" hidden disabled>最多提交</option>
+            </select>
+          </div>
+          <div class="list-heading">
+            <div class="heading-group"><h3 id="library-heading">收藏</h3><span id="library-count" class="count-badge"></span></div>
+            <button id="clear-history" type="button" class="text-button danger" hidden><span data-icon="Trash2"></span><span data-i18n="clearHistory">清除历史</span></button>
+          </div>
+          <div class="library-selection-toolbar">
+            <label class="page-selection-control"><input id="library-select-page" type="checkbox"><span id="library-page-selection-label" data-i18n="selectPage">选择本页</span></label>
+            <p id="library-selection-summary" class="meta-label" role="status"></p>
+            <div class="selection-actions">
+              <button id="library-clear-selection" type="button" class="icon-button" aria-label="清除选择" title="清除选择" data-i18n-label="clearSelection"><span data-icon="X"></span></button>
+              <button id="library-batch" type="button" class="primary"><span data-icon="Plus"></span><span data-i18n="batchQueue">批量入队</span></button>
+            </div>
+          </div>
+          <ul id="library-list" class="track-list"></ul>
+          <nav id="library-pagination" class="library-pagination" aria-label="音乐库分页" data-i18n-label="libraryPagination" hidden>
+            <button id="library-previous" type="button" class="icon-button" aria-label="上一页" title="上一页" data-i18n-label="previousPage"><span data-icon="ChevronLeft"></span></button>
+            <span id="library-page-label" class="meta-label" role="status"></span>
+            <button id="library-next" type="button" class="icon-button" aria-label="下一页" title="下一页" data-i18n-label="nextPage"><span data-icon="ChevronRight"></span></button>
+          </nav>
+        </section>
+        <section id="maintenance-view" hidden>
+          <div class="section-heading">
+            <h2 id="maintenance-heading" tabindex="-1" data-i18n="maintenance">维护</h2>
+            <button id="health-refresh" type="button" class="icon-button" aria-label="检查依赖" title="检查依赖" data-i18n-label="checkDependencies"><span data-icon="RefreshCw"></span></button>
+          </div>
+          <div class="runtime-summary">
+            <div><span data-i18n="runtime">运行状态</span><strong id="runtime-health">--</strong></div>
+            <div><span data-i18n="activeJobs">活动任务</span><strong id="active-jobs">0</strong></div>
+            <div><span data-i18n="platform">运行平台</span><strong id="platform">--</strong></div>
+          </div>
+          <div class="list-heading"><h3 data-i18n="dependencies">运行依赖</h3><span class="section-symbol" data-icon="Wrench"></span></div>
+          <p id="maintenance-notice" role="status" hidden></p>
+          <ul id="dependencies" class="dependency-list"></ul>
+          <p id="updater-reason" role="status" hidden></p>
+          <div class="maintenance-actions">
+            <select id="component" aria-label="更新组件" data-i18n-label="updateComponent"><option value="all" data-i18n="allComponents">全部组件</option><option>yt-dlp</option><option>Deno</option><option>FFmpeg</option></select>
+            <button id="update-dependencies" type="button" class="primary"><span data-icon="Download"></span><span data-i18n="update">更新依赖</span></button>
+          </div>
+          <div id="update-state" hidden>
+            <div><span id="update-phase" role="status"></span><button id="cancel-update" type="button" class="text-button"><span data-icon="X"></span><span data-i18n="cancel">取消</span></button></div>
+            <progress id="update-progress" max="100" aria-label="更新进度" data-i18n-label="updateProgress"></progress>
+            <p id="update-metrics"></p><p id="update-message"></p><p id="update-versions"></p><p id="recovery-message" role="alert" hidden></p>
+          </div>
+          <div class="section-heading cache-heading"><h3 data-i18n="audioCache">音频缓存</h3><button id="clean-cache" type="button" class="text-button"><span data-icon="Trash2"></span><span data-i18n="cleanCache">清理缓存</span></button></div>
+          <p id="cache-summary"></p>
+        </section>
+      </div>
+      <aside id="queue-pane" aria-label="播放队列" data-i18n-label="playQueue">
+        <div class="section-heading">
+          <h2 id="queue-heading" tabindex="-1" data-i18n="queue">队列</h2>
+          <div class="queue-title-actions"><span id="queue-state"></span><button id="forget-session" type="button" class="icon-button" aria-label="移除空会话" title="移除空会话" data-i18n-label="forgetSession"><span data-icon="X"></span></button></div>
+        </div>
+        <p id="queue-session" class="meta-label"></p>
+        <div class="now-label"><span data-icon="GraphicEq"></span><span data-i18n="currentTask">当前任务</span></div>
+        <div id="now-playing" class="now-playing" role="status" hidden></div>
+        <div id="queue-idle" class="queue-idle"><span data-icon="Music2"></span><span data-i18n="noCurrent">暂无进行中的歌曲</span></div>
+        <div class="queue-toolbar">
+          <button id="resume" type="button" class="primary"><span data-icon="Play"></span><span data-i18n="resume">继续</span></button>
+          <button id="pause" type="button" class="icon-button" aria-label="暂停" title="暂停" data-i18n-label="pause"><span data-icon="Pause"></span></button>
+          <button id="skip" type="button" class="icon-button" aria-label="下一首" title="下一首" data-i18n-label="skip"><span data-icon="SkipForward"></span></button>
+          <button id="clear-queue" type="button" class="icon-button danger" aria-label="清空队列" title="清空队列" data-i18n-label="clearQueue"><span data-icon="Trash2"></span></button>
+        </div>
+        <p id="queue-error" class="queue-error" hidden></p>
+        <div class="list-heading"><h3 data-i18n="upNext">待播歌曲</h3><span id="queue-total"></span></div>
+        <p id="queue-duration" class="meta-label" role="status"></p>
+        <ol id="queue-list" class="queue-list"></ol>
+      </aside>
+    </main>
+  </div>
+  <div id="toast" role="status" hidden></div>
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog"><span class="dialog-symbol" data-icon="CircleAlert"></span><h2 id="confirm-title"></h2><p id="confirm-detail"></p><ol id="confirm-tracks" class="confirmation-tracks" hidden></ol><div class="dialog-actions"><button type="submit" value="cancel" data-i18n="cancel">取消</button><button type="submit" value="confirm" class="primary" data-i18n="confirm">确认</button></div></form>
+  </dialog>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

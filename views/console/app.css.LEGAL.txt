@@ -1,0 +1,4 @@
+Bundled license information:
+
+material/dist/styles/icon-button.css:
+  /*! material v3.14.1 | MIT */

@@ -1,0 +1,46 @@
+# Local environments and generated test output
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.verification/
+test-results/
+playwright-report/
+coverage/
+.coverage*
+
+# Runtime state, caches, logs and local release archives
+data/
+dist/
+*.log
+*.zip
+*.corrupt-*
+
+# Secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+credentials*.json
+/.npmrc
+/.pypirc
+/.netrc
+/.ssh/
+*.pem
+*.p12
+*.pfx
+*.key
+!core/vendor/yt-dlp-public.key
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Unpublished audit artifacts and unlicensed historical fixture
+/BUILD-*.md
+/WEBUI-M3-*.md
+/MIGRATION-ACCEPTANCE-*.md
+/tests/fixtures/music.jpg
