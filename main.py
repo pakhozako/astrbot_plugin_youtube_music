@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import random
 import re
 import shutil
 import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -23,16 +26,18 @@ from .core.dependency_manager import DependencyManager
 from .core.library import UserLibrary
 from .core.maintenance import run_blocking
 from .core.queue import MAX_BATCH_SIZE, JobLimiter, pending_queue_summary
+from .core.search_quality import version_label
 from .core.search_recall import SearchRecall, SearchReply
 from .core.service import UserFacingError, YouTubeMusicService
 from .core.settings import Settings
 from .core.state import QueueState, session_key
-from .core.store_validation import valid_int, valid_song
+from .core.store_validation import valid_int, valid_song, valid_thumbnail_url
 from .core.utils import (
     Song,
     cleanup_stale_owned_job_dirs,
     extract_command_argument,
     format_duration,
+    is_owned_job_dir,
     mark_owned_job_dir,
     parse_youtube_url,
     safe_text,
@@ -42,14 +47,25 @@ from .core.webui import WebUIMixin
 PLUGIN_NAME = "astrbot_plugin_youtube_music"
 HELP_TEXT = """YouTube 点歌
 /点歌 <关键词>：搜索
-/点歌 <编号或视频链接>：加入当前会话队列
+/点歌 歌手 <名称>：搜索歌手作品
+/点歌 <编号> [结果码] / <视频链接>：加入队列
+/点歌 下一页 / 上一页 / 翻页 <页码>
+/点歌 重搜 [关键词] / 取消搜索
+/点歌 详情 <编号> [结果码]：歌曲信息与封面
 /点歌 队列 / 状态：查看队列
-/点歌 收藏 <编号> / 收藏列表 / 播放收藏 <编号>
+/点歌 收藏 <编号> [结果码] / 收藏列表 / 播放收藏 <编号>
 /点歌 取消收藏 <编号> / 最近 / 清除历史
+/点歌 重播 [历史编号] / 随机：个人收藏与历史
 /点歌 取消：取消自己的待播歌曲
 /点歌 移除 <队列编号>：移除自己的待播歌曲
 队列管理员：/点歌 继续 / 暂停 / 下一首 / 清空队列
-仅支持单个 YouTube 视频。"""
+结果编号和结果码仅限本人当前会话；仅点播单个 YouTube 视频。"""
+
+
+@dataclass(frozen=True)
+class SongDetailsReply:
+    text: str
+    thumbnail_url: str = ""
 
 
 class YouTubeMusicPlugin(WebUIMixin, Star):
@@ -60,6 +76,8 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
         self.settings = Settings.from_config(config, data_dir=self.data_dir)
         self.job_root = self.data_dir / "cache" / "jobs"
+        self._data_dir_real = self.data_dir.resolve()
+        self._job_root_real = self.job_root.resolve()
         self.state = self.library = self.audio_cache = None
         self.dependency_manager = DependencyManager(self.data_dir, self.settings)
         self.dependency_gate = self.dependency_manager.dependency_gate
@@ -75,13 +93,15 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         self._requests: set[asyncio.Task] = set()
         self._candidates: OrderedDict[tuple[str, str], dict] = OrderedDict()
         self._search_busy: set[tuple[str, str]] = set()
+        self._search_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._history_views: OrderedDict[tuple[str, str], dict] = OrderedDict()
         self._running = False
         self._terminating = False
         self._search_recall = SearchRecall(
             delay=self.settings.search_result_recall_delay_seconds,
             timeout=min(10, self.settings.send_timeout_seconds),
             semaphore=self.service._stage_limit("send_concurrency", self.settings.send_concurrency),
-            is_current=lambda owner, token: self._candidates.get(owner, {}).get("token") == token,
+            is_current=self._is_current_result,
         )
         self._init_webui()
         tool = YouTubeMusicTool()
@@ -142,7 +162,12 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         await self._search_recall.close()
         await self.dependency_gate.close()
         current = asyncio.current_task()
-        owned = set(self._workers.values()) | self._requests | self.dependency_gate.task_snapshot()
+        owned = (
+            set(self._workers.values())
+            | self._requests
+            | set(self._search_tasks.values())
+            | self.dependency_gate.task_snapshot()
+        )
         if self._dependency_update_task is not None:
             owned.add(self._dependency_update_task)
         tasks = [task for task in owned if task is not current and not task.done()]
@@ -154,6 +179,8 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         self._current.clear()
         self._candidates.clear()
         self._search_busy.clear()
+        self._search_tasks.clear()
+        self._history_views.clear()
         if self.audio_cache is not None:
             self.audio_cache.protected_video_ids = set()
 
@@ -209,14 +236,39 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
     def _prune_candidates(self):
         now = time.monotonic()
         ttl = self.settings.result_ttl_minutes * 60
-        for owner in list(self._candidates):
-            if now - self._candidates[owner]["at"] >= ttl:
-                self._candidates.pop(owner)
-        while len(self._candidates) > 500:
-            self._candidates.popitem(last=False)
+        for registry in (self._candidates, self._history_views):
+            for owner in list(registry):
+                if now - registry[owner]["at"] >= ttl:
+                    registry.pop(owner)
+            while len(registry) > 500:
+                registry.popitem(last=False)
 
-    async def search(self, owner: tuple[str, str], query: str) -> list[Song]:
+    def _is_current_result(self, owner, token):
+        self._prune_candidates()
+        record = self._candidates.get(owner)
+        return bool(record and record.get("selectable", True) and record.get("token") == token)
+
+    def _candidate_record(self, owner, *, code=None):
+        self._prune_candidates()
+        record = self._candidates.get(owner)
+        if code is not None and (
+            not isinstance(code, str)
+            or not re.fullmatch(r"[a-fA-F0-9]{8}", code)
+            or not record
+            or record.get("generation", record.get("token", ""))[:8] != code.lower()
+        ):
+            raise UserFacingError("结果码已过期或不属于你，请重新搜索。")
+        if not record or not record.get("selectable", True) or not record.get("songs"):
+            raise UserFacingError("歌曲编号无效或已过期，请重新搜索。")
+        return record
+
+    async def search(
+        self, owner: tuple[str, str], query: str, *, paged: bool = False
+    ) -> list[Song]:
         self._require_running()
+        if not isinstance(query, str) or not query.strip():
+            raise UserFacingError("请输入搜索关键词。")
+        query = query.strip()
         self._prune_candidates()
         previous = self._candidates.get(owner)
         if (
@@ -226,9 +278,19 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         ):
             raise UserFacingError("搜索过于频繁，请稍后重试。")
         self._search_busy.add(owner)
-        token = uuid.uuid4().hex
+        task = asyncio.current_task()
+        self._search_tasks[owner] = task
+        generation = uuid.uuid4().hex
         self._search_recall.supersede(owner)
-        self._candidates[owner] = {"at": time.monotonic(), "songs": [], "token": token}
+        self._candidates[owner] = {
+            "at": time.monotonic(),
+            "songs": [],
+            "token": generation,
+            "generation": generation,
+            "query": query,
+            "page": 1,
+            "selectable": False,
+        }
         self._candidates.move_to_end(owner)
         self._prune_candidates()
         try:
@@ -239,21 +301,192 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 songs = (
                     [await self.service.get_metadata(url)]
                     if url
+                    else await self.service.search(query, candidate_pool=True)
+                    if paged
                     else await self.service.search(query)
                 )
-            self._candidates[owner] = {"at": time.monotonic(), "songs": songs, "token": token}
+            self._require_running()
+            if paged:
+                songs = songs[: self.settings.search_results * 3]
+            self._candidates[owner] = {
+                "at": time.monotonic(),
+                "songs": songs,
+                "token": generation,
+                "generation": generation,
+                "query": query,
+                "page": 1,
+                "selectable": True,
+            }
             self._candidates.move_to_end(owner)
             self._prune_candidates()
             return songs
         finally:
             self._search_busy.discard(owner)
+            if self._search_tasks.get(owner) is task:
+                self._search_tasks.pop(owner, None)
 
-    def candidate(self, owner, index):
-        self._prune_candidates()
-        songs = self._candidates.get(owner, {}).get("songs", [])
+    def candidate(self, owner, index, *, code=None):
+        songs = self._candidate_record(owner, code=code)["songs"]
         if isinstance(index, bool) or not isinstance(index, int) or not 1 <= index <= len(songs):
             raise UserFacingError("歌曲编号无效或已过期，请重新搜索。")
         return songs[index - 1]
+
+    async def _cancel_search(self, owner):
+        task = self._search_tasks.get(owner)
+        if task is None or task.done() or task is asyncio.current_task():
+            return "你没有进行中的搜索。"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return "已取消你的搜索，待播队列未改变。"
+
+    def _invalidate_search_reply(self, reply):
+        record = self._candidates.get(reply.owner)
+        if record and record.get("token") == reply.token:
+            record["selectable"] = False
+
+    def _search_reply(self, event, owner, *, page=None):
+        record = self._candidate_record(owner)
+        page_size = self.settings.search_results
+        pages = (len(record["songs"]) + page_size - 1) // page_size
+        page = record.get("page", 1) if page is None else page
+        if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= pages:
+            raise UserFacingError(f"页码无效，当前共有 {pages} 页。")
+        self._search_recall.supersede(owner)
+        token = uuid.uuid4().hex
+        record["token"] = token
+        record["page"] = page
+        start = (page - 1) * page_size
+        code = record["generation"][:8]
+        requester = safe_text(event.get_sender_name(), 80) or safe_text(owner[1], 24)
+        lines = [
+            f"YouTube 搜索 · {requester}（{safe_text(owner[1], 24)}）",
+            f"结果码 {code} · 第 {page}/{pages} 页 · 共 {len(record['songs'])} 首",
+            self.song_list(
+                record["songs"][start : start + page_size], start_index=start + 1, versions=True
+            ),
+            f"/点歌 编号 {code} · /点歌 详情 编号 {code}",
+        ]
+        if pages > 1:
+            lines.append("/点歌 上一页 / 下一页 / 翻页 页码")
+        return SearchReply(owner, token, "\n".join(lines))
+
+    @staticmethod
+    def _selection_arguments(value):
+        parts = value.split()
+        if not 1 <= len(parts) <= 2:
+            raise UserFacingError("请提供歌曲编号及可选的 8 位结果码。")
+        index = YouTubeMusicPlugin._index(parts[0])
+        code = parts[1] if len(parts) == 2 else None
+        if code is not None and not re.fullmatch(r"[a-fA-F0-9]{8}", code):
+            raise UserFacingError("结果码应为搜索列表中的 8 位编号。")
+        return index, code
+
+    def _song_details(self, owner, index, code):
+        song = self.candidate(owner, index, code=code)
+        version = version_label(song)
+        lines = [
+            f"歌曲：{safe_text(song.title, 200)}",
+            f"歌手：{safe_text(song.artist, 120)}",
+            f"时长：{format_duration(song.duration)}",
+            f"版本：{version or '未标注'}",
+            song.url,
+        ]
+        thumbnail = song.thumbnail_url if valid_thumbnail_url(song.thumbnail_url) else ""
+        return SongDetailsReply("\n".join(lines), thumbnail)
+
+    async def _history_song(self, owner, index):
+        if index is None:
+            rows = await run_blocking(self.library.history, owner)
+            if not rows:
+                raise UserFacingError("暂无语音历史。")
+            return Song(**rows[0]["song"])
+        self._prune_candidates()
+        view = self._history_views.get(owner)
+        if not view or not 1 <= index <= len(view["songs"]):
+            raise UserFacingError("历史编号无效或已过期，请先发送 /点歌 最近。")
+        song = view["songs"][index - 1]
+        songs = await run_blocking(self.library.songs_for_source, owner, "history", [song.video_id])
+        return songs[0]
+
+    async def _random_song(self, key, owner):
+        favorites = await run_blocking(self.library.favorites, owner)
+        history = await run_blocking(self.library.history, owner)
+        queued = {row["song"]["video_id"] for row in self.state.snapshot("queues", key, default=[])}
+        current = self._current.get(key)
+        if current:
+            queued.add(current["row"]["song"]["video_id"])
+        pool = {}
+        for song in [*favorites, *(Song(**row["song"]) for row in history)]:
+            if (
+                song.video_id not in queued
+                and valid_int(song.duration, 1, self.settings.max_duration_seconds)
+                and valid_song(asdict(song))
+            ):
+                try:
+                    self.service.preflight(song, voice=self.settings.send_strategy != "link_only")
+                except UserFacingError:
+                    continue
+                pool.setdefault(song.video_id, song)
+        if not pool:
+            raise UserFacingError(
+                "你的收藏和历史中没有可随机点播的歌曲，已排队、当前曲目和超限歌曲会排除。"
+            )
+        return random.choice(list(pool.values()))
+
+    async def _detail_result(self, event, reply):
+        thumbnail = reply.thumbnail_url
+        if not thumbnail or not valid_thumbnail_url(thumbnail):
+            return event.plain_result(reply.text)
+        try:
+            async with asyncio.timeout(4):
+                async with self.service._stage_limit("search_concurrency", 2):
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=4),
+                        auto_decompress=False,
+                        trust_env=False,
+                        headers={
+                            "Accept": "image/jpeg,image/png,image/webp",
+                            "Accept-Encoding": "identity",
+                        },
+                    ) as client:
+                        async with client.get(
+                            thumbnail,
+                            allow_redirects=False,
+                            proxy=self.settings.youtube_proxy or None,
+                        ) as response:
+                            mime = (
+                                response.headers.get("Content-Type", "")
+                                .split(";", 1)[0]
+                                .lower()
+                                .strip()
+                            )
+                            encoding = response.headers.get("Content-Encoding", "").lower().strip()
+                            if (
+                                response.status != 200
+                                or mime not in {"image/jpeg", "image/png", "image/webp"}
+                                or encoding not in {"", "identity"}
+                                or response.content_length is not None
+                                and response.content_length > 1024 * 1024
+                            ):
+                                return event.plain_result(reply.text)
+                            content = bytearray()
+                            async for chunk in response.content.iter_chunked(16384):
+                                if len(content) + len(chunk) > 1024 * 1024:
+                                    return event.plain_result(reply.text)
+                                content.extend(chunk)
+                            image = bytes(content)
+            signatures = {
+                "image/jpeg": image.startswith(b"\xff\xd8\xff"),
+                "image/png": image.startswith(b"\x89PNG\r\n\x1a\n"),
+                "image/webp": len(image) >= 12 and image[:4] == b"RIFF" and image[8:12] == b"WEBP",
+            }
+            if not signatures[mime]:
+                return event.plain_result(reply.text)
+            return event.chain_result([Comp.Image.fromBytes(image), Comp.Plain(reply.text)])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return event.plain_result(reply.text)
 
     def _known_session(self, key):
         session = self.state.snapshot("sessions", key) if isinstance(key, str) else None
@@ -288,6 +521,7 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 raise UserFacingError("歌曲信息无效，请重新选择。")
             if not valid_int(song.duration, 1, self.settings.max_duration_seconds):
                 raise UserFacingError("歌曲超过时长限制或时长未知。")
+            self.service.preflight(song, voice=self.settings.send_strategy != "link_only")
             data = asdict(song)
             if not valid_song(data):
                 raise UserFacingError("歌曲信息无效，请重新选择。")
@@ -306,17 +540,24 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         async with self._queue_lock:
             self._require_running()
             self._known_session(key)
+            current_id = self._current.get(key, {}).get("row", {}).get("song", {}).get("video_id")
 
             def add(payload):
                 rows = payload["queues"].get(key, [])
                 existing = {row["song"]["video_id"] for row in rows}
+                if current_id:
+                    existing.add(current_id)
                 skipped = [
                     row["song"]["video_id"]
                     for row in prepared
                     if row["song"]["video_id"] in existing
                 ]
                 if skipped and not skip_existing:
-                    raise UserFacingError("这首歌已在队列中。")
+                    raise UserFacingError(
+                        "这首歌正在播放或处理，请等待后再点播。"
+                        if current_id in skipped
+                        else "这首歌已在队列中。"
+                    )
                 additions = [row for row in prepared if row["song"]["video_id"] not in existing]
                 if additions and len(rows) + len(additions) > self.settings.max_session_queue:
                     raise UserFacingError(
@@ -345,6 +586,38 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
             self._broadcast()
         return result
 
+    def enqueue_feedback(self, key, song, position):
+        payload = self.state.snapshot()
+        lines = [
+            f"已加入队列 #{position}：{safe_text(song.title)} · "
+            f"{safe_text(song.artist, 60)} · {format_duration(song.duration)}"
+        ]
+        if key in self._errors or key in payload["paused"]:
+            lines.append("队列已暂停，等待管理员核对后继续。")
+            return "\n".join(lines)
+        rows = payload["queues"].get(key, [])
+        index = next(
+            (index for index, row in enumerate(rows) if row["song"]["video_id"] == song.video_id),
+            max(0, position - 1),
+        )
+        ahead = rows[:index]
+        current = self._current.get(key)
+        if current and current["submitted"]:
+            ahead = [row for row in ahead if row["id"] != current["row"]["id"]]
+        summary = pending_queue_summary(ahead)
+        count = summary["count"]
+        wait = (
+            2 * count
+            if self.settings.send_strategy == "link_only"
+            else summary["duration_seconds"] + 2 * count
+        )
+        if current and current["submitted"] and current["row"]["song"]["video_id"] != song.video_id:
+            count += 1
+            wait += max(0, current.get("wait_until", time.monotonic()) - time.monotonic())
+        if count:
+            lines.append(f"前方 {count} 首 · 播放等待约 {format_duration(math.ceil(wait))}")
+        return "\n".join(lines)
+
     def _start_worker(self, key):
         if self._terminating or not self._running or key in self._workers or key in self._errors:
             return
@@ -361,10 +634,39 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
             self._current[key]["phase"] = phase
         self._broadcast()
 
+    def _job_path_available(self, job):
+        try:
+            return (
+                job.parent == self.job_root
+                and job.name.startswith("job-")
+                and self.data_dir.resolve() == self._data_dir_real
+                and self.job_root.resolve() == self._job_root_real
+                and self._job_root_real.is_relative_to(self._data_dir_real)
+                and job.resolve().parent == self._job_root_real
+                and not any(path.is_symlink() or path.is_junction() for path in (job, *job.parents))
+            )
+        except (OSError, RuntimeError):
+            return False
+
     def _create_job(self, job):
+        if not self._job_path_available(job):
+            raise UserFacingError("临时音频目录无效或已改变，请检查插件数据目录。")
         self.job_root.mkdir(parents=True, exist_ok=True)
+        if not self._job_path_available(job):
+            raise UserFacingError("临时音频目录已改变，未启动下载。")
         job.mkdir()
         mark_owned_job_dir(job)
+
+    def _cleanup_job(self, job):
+        try:
+            if not self._job_path_available(job) or not is_owned_job_dir(job):
+                logger.warning("[YouTubeMusic] 已拒绝清理不属于任务根目录的临时路径。")
+                return
+            shutil.rmtree(job)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("[YouTubeMusic] 临时音频目录清理失败：%s", type(exc).__name__)
 
     async def _send(self, umo, chain):
         result = await asyncio.wait_for(
@@ -425,16 +727,29 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                         timeout=self.settings.queue_wait_timeout_seconds
                     ):
                         wav = None
+                        media = {}
                         if self.settings.send_strategy != "link_only":
                             job = self.job_root / f"job-{uuid.uuid4().hex}"
                             await run_blocking(self._create_job, job)
-                            wav, song, _ = await self.service.download_and_convert(
+                            wav, song, media = await self.service.download_and_convert(
                                 song, job, on_stage=lambda phase: self._phase(key, phase)
                             )
+                        self._current[key]["row"] = {**row, "song": asdict(song)}
                         self._phase(key, "提交消息")
                         audio = await self._send_song(session, song, wav)
                         submitted = True
                         self._current[key]["submitted"] = True
+                        duration = media.get("duration_seconds", song.duration)
+                        if (
+                            isinstance(duration, bool)
+                            or not isinstance(duration, (int, float))
+                            or not math.isfinite(duration)
+                            or duration <= 0
+                        ):
+                            duration = song.duration or 0
+                        self._current[key]["wait_until"] = time.monotonic() + (
+                            duration + 2 if audio else 2
+                        )
 
                         def finish(data, entry_id=row["id"]):
                             data["queues"][key] = [
@@ -443,18 +758,34 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                                 if item["id"] != entry_id
                             ]
 
-                        await run_blocking(self.state.update, finish)
-                        if audio:
-                            await run_blocking(
-                                self.library.add_history_for_owner_id, row["owner"], song
-                            )
+                        def finish_submission(
+                            finalize_queue=finish, record=row, resolved=song, record_audio=audio
+                        ):
+                            self.state.update(finalize_queue)
+                            if record_audio:
+                                self.library.add_history_for_owner_id(record["owner"], resolved)
+
+                        # Parent cancellation must not hide a failed persistence write.
+                        finalization = asyncio.create_task(run_blocking(finish_submission))
+                        cancelled = False
+                        while True:
+                            try:
+                                await asyncio.shield(finalization)
+                                break
+                            except asyncio.CancelledError:
+                                cancelled = True
+                                if finalization.done():
+                                    finalization.result()
+                                    break
+                        if cancelled:
+                            raise asyncio.CancelledError
                         self._errors.pop(key, None)
                         self._error_entry_ids.pop(key, None)
                 if job:
-                    await run_blocking(shutil.rmtree, job)
+                    await run_blocking(self._cleanup_job, job)
                     job = None
                 self._phase(key, "已提交语音" if audio else "已提交链接")
-                await asyncio.sleep((song.duration or 0) + 2 if audio else 2)
+                await asyncio.sleep(max(0, self._current[key]["wait_until"] - time.monotonic()))
                 self._current.pop(key, None)
         except asyncio.CancelledError:
             raise
@@ -479,7 +810,7 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 logger.error("[YouTubeMusic] 暂停状态保存失败：%s", type(save_error).__name__)
         finally:
             if job:
-                await run_blocking(shutil.rmtree, job, ignore_errors=True)
+                await run_blocking(self._cleanup_job, job)
             self._current.pop(key, None)
             self._workers.pop(key, None)
             self.audio_cache.protected_video_ids = {
@@ -613,9 +944,13 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
             lines[-1] += f"（{summary['unknown_duration_count']} 首时长未知）"
         current = self._current.get(key)
         if current:
-            lines.append(f"{current['phase']}：{safe_text(current['row']['song']['title'])}")
+            lines.append(
+                f"{current['phase']}：{safe_text(current['row']['song']['title'])} · "
+                f"点歌：{safe_text(current['row'].get('requested_by') or '未知点歌者', 40)}"
+            )
         lines.extend(
-            f"{index}. {safe_text(row['song']['title'])} · {format_duration(row['song']['duration'])}"
+            f"{index}. {safe_text(row['song']['title'])} · {safe_text(row['song']['artist'], 60)} · "
+            f"{format_duration(row['song']['duration'])} · 点歌：{safe_text(row.get('requested_by') or '未知点歌者', 40)}"
             for index, row in enumerate(rows, 1)
         )
         if not rows:
@@ -631,6 +966,29 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 return HELP_TEXT
             if argument in {"队列", "状态"}:
                 return self.queue_text(key)
+            if argument == "取消搜索":
+                return await self._cancel_search(owner)
+            if argument in {"下一页", "上一页"} or argument.startswith("翻页 "):
+                record = self._candidate_record(owner)
+                page = (
+                    self._index(argument[3:])
+                    if argument.startswith("翻页 ")
+                    else record.get("page", 1) + (1 if argument == "下一页" else -1)
+                )
+                return self._search_reply(event, owner, page=page)
+            if argument in {"重搜", "重新搜索"} or argument.startswith(("重搜 ", "重新搜索 ")):
+                alias = "重新搜索" if argument.startswith("重新搜索") else "重搜"
+                query = argument[len(alias) :].strip()
+                if not query:
+                    self._prune_candidates()
+                    query = self._candidates.get(owner, {}).get("query", "")
+                if not query:
+                    raise UserFacingError("没有可重搜的关键词，请发送 /点歌 重搜 关键词。")
+                songs = await self.search(owner, query, paged=True)
+                return self._search_reply(event, owner) if songs else "未找到符合时长限制的歌曲。"
+            if argument.startswith("详情 "):
+                index, code = self._selection_arguments(argument[3:])
+                return self._song_details(owner, index, code)
             controls = {
                 "继续": "resume",
                 "暂停": "pause",
@@ -655,19 +1013,23 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 return self.song_list(songs) or "暂无收藏。"
             if argument == "最近":
                 rows = await run_blocking(self.library.history, owner)
-                return (
-                    self.song_list([Song(**row["song"]) for row in rows[:10]])
-                    or "暂无语音提交记录。"
-                )
+                songs = [Song(**row["song"]) for row in rows[:10]]
+                self._history_views[owner] = {"at": time.monotonic(), "songs": songs}
+                self._history_views.move_to_end(owner)
+                self._prune_candidates()
+                return self.song_list(songs) or "暂无语音提交记录。"
             if argument == "清除历史":
                 await run_blocking(self.library.clear_history, owner)
+                self._history_views.pop(owner, None)
                 return "已清除历史。"
             if argument.startswith("收藏 "):
-                song = self.candidate(owner, self._index(argument[3:]))
+                index, code = self._selection_arguments(argument[3:])
+                song = self.candidate(owner, index, code=code)
                 token = self._candidates[owner]["token"]
                 added, _ = await run_blocking(self.library.add_favorite, owner, song)
                 self._search_recall.selected(owner, token)
                 return "已收藏。" if added else "已在收藏中。"
+            selected_token = None
             if argument.startswith(("播放收藏 ", "取消收藏 ")):
                 songs = await run_blocking(self.library.favorites, owner)
                 index = self._index(argument[5:])
@@ -677,23 +1039,27 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 if argument.startswith("取消"):
                     await run_blocking(self.library.remove_favorite, owner, song.video_id)
                     return "已移除收藏。"
-            elif argument.isdecimal():
-                song = self.candidate(owner, self._index(argument))
-                token = self._candidates[owner]["token"]
+            elif argument == "重播" or argument.startswith("重播 "):
+                index = self._index(argument[3:]) if argument.startswith("重播 ") else None
+                song = await self._history_song(owner, index)
+            elif argument == "随机":
+                song = await self._random_song(key, owner)
+            elif argument.isdecimal() or re.fullmatch(r"\d{1,3}\s+[a-fA-F0-9]{8}", argument):
+                index, code = self._selection_arguments(argument)
+                song = self.candidate(owner, index, code=code)
+                selected_token = self._candidates[owner]["token"]
             elif parse_youtube_url(argument):
                 song = (await self.search(owner, argument))[0]
             else:
-                songs = await self.search(owner, argument)
+                query = argument[3:].strip() if argument.startswith("歌手 ") else argument
+                songs = await self.search(owner, query, paged=True)
                 if not songs:
                     return "未找到符合时长限制的歌曲。"
-                token = self._candidates[owner]["token"]
-                return SearchReply(
-                    owner, token, f"YouTube 搜索结果 · {token}\n{self.song_list(songs)}"
-                )
+                return self._search_reply(event, owner)
             position = await self.enqueue(key, song, owner, event.get_sender_name())
-            if argument.isdecimal():
-                self._search_recall.selected(owner, token)
-            return f"已加入队列 #{position}：{safe_text(song.title)}"
+            if selected_token:
+                self._search_recall.selected(owner, selected_token)
+            return self.enqueue_feedback(key, song, position)
 
     @staticmethod
     def _index(value):
@@ -702,26 +1068,41 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         return int(value)
 
     @staticmethod
-    def song_list(songs):
+    def song_list(songs, *, start_index=1, versions=False):
         return "\n".join(
-            f"{index}. {safe_text(song.title)} · {safe_text(song.artist)} · {format_duration(song.duration)}"
-            for index, song in enumerate(songs, 1)
+            f"{index}. {safe_text(song.title)} · {safe_text(song.artist)} · "
+            f"{format_duration(song.duration)}"
+            + (f" · {version_label(song)}" if versions and version_label(song) else "")
+            for index, song in enumerate(songs, start_index)
         )
 
     @filter.command("点歌")
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def song_command(self, event: AstrMessageEvent):
+        search_reply = None
         try:
             result = await self.dispatch_music(event, extract_command_argument(event.message_str))
             if isinstance(result, SearchReply):
+                search_reply = result
                 if self.settings.search_result_auto_recall:
                     async with self.operation():
-                        await self._search_recall.send(event, result)
+                        sent = await self._search_recall.send(event, result)
+                    if sent is False:
+                        self._invalidate_search_reply(result)
                     return
                 result = result.text
+            elif isinstance(result, SongDetailsReply):
+                async with self.operation():
+                    detail = await self._detail_result(event, result)
+                yield detail
+                return
         except asyncio.CancelledError:
+            if search_reply:
+                self._invalidate_search_reply(search_reply)
             raise
         except Exception as exc:
+            if search_reply:
+                self._invalidate_search_reply(search_reply)
             logger.error("[YouTubeMusic] 点歌请求失败：%s", type(exc).__name__)
             result = (
                 safe_text(str(exc), 200)
@@ -746,7 +1127,7 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 position = await self.enqueue(key, song, owner, event.get_sender_name())
                 if index:
                     self._search_recall.selected(owner, token)
-                return f"已加入队列 #{position}：{safe_text(song.title)}"
+                return self.enqueue_feedback(key, song, position)
             if action == "queue_status":
                 return self.queue_text(key)
             controls = {

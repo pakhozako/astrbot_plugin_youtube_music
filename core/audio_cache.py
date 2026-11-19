@@ -189,6 +189,77 @@ class AudioCache:
             return None
 
     @_cache_locked
+    def copy_for_job(
+        self, video_id: str, job_dir: Path, *, max_size_bytes: int | None = None
+    ) -> AudioCacheEntry | None:
+        """Copy a reusable cache entry to private job audio before releasing the cache lock."""
+        directory = Path(job_dir)
+        if not directory.is_dir() or any(
+            path.is_symlink() or path.is_junction() for path in (directory, *directory.parents)
+        ):
+            raise ValueError("invalid audio job directory")
+        directory_real = directory.resolve(strict=True)
+        if directory_real.is_relative_to(self._directory_real):
+            raise ValueError("audio jobs cannot overwrite the shared cache")
+        if max_size_bytes is not None and (
+            not isinstance(max_size_bytes, int)
+            or isinstance(max_size_bytes, bool)
+            or max_size_bytes <= 44
+        ):
+            raise ValueError("invalid audio snapshot size limit")
+        limit = min(self.max_size_bytes, max_size_bytes or self.max_size_bytes)
+        destination = directory / "record.wav"
+
+        def current_directory():
+            try:
+                return (
+                    directory.is_dir()
+                    and directory.resolve(strict=True) == directory_real
+                    and not any(
+                        path.is_symlink() or path.is_junction()
+                        for path in (directory, *directory.parents)
+                    )
+                )
+            except (OSError, RuntimeError):
+                return False
+
+        def regular_destination():
+            return (
+                not destination.is_symlink()
+                and not destination.is_junction()
+                and (not destination.exists() or destination.is_file())
+            )
+
+        if not regular_destination():
+            raise ValueError("invalid audio job destination")
+        entry = self.lookup(video_id)
+        if entry is None:
+            return None
+        size = entry.path.stat().st_size
+        if size > limit:
+            return None
+        temporary = directory / f".record.wav.{uuid.uuid4().hex}.tmp"
+        try:
+            if not current_directory():
+                raise ValueError("audio job directory changed")
+            copied = 0
+            with entry.path.open("rb") as source, temporary.open("xb") as target:
+                while chunk := source.read(64 * 1024):
+                    copied += len(chunk)
+                    if copied > limit:
+                        raise ValueError("cached audio exceeds snapshot size limit")
+                    target.write(chunk)
+            if copied != size or copied <= 44:
+                raise ValueError("cached audio changed while copying")
+            if not current_directory() or not regular_destination():
+                raise ValueError("audio job destination changed")
+            os.replace(temporary, destination)
+            return AudioCacheEntry(destination, entry.song, dict(entry.media))
+        finally:
+            if current_directory() and not temporary.is_symlink() and temporary.is_file():
+                temporary.unlink(missing_ok=True)
+
+    @_cache_locked
     def store(self, song: Song, wav_source: Path, media: dict[str, Any]) -> Path | None:
         if (
             not self._directory_available()

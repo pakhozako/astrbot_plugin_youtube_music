@@ -12,6 +12,15 @@ from urllib.parse import parse_qs, urlsplit
 from .store_validation import valid_thumbnail_url
 
 COMMAND_NAMES = ("点歌",)
+_YOUTUBE_HOSTS = {
+    "youtu.be",
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+}
 
 
 def safe_text(value: object, limit: int = 180) -> str:
@@ -32,7 +41,24 @@ def mark_owned_job_dir(path: Path) -> None:
     """Write a plugin ownership marker into a freshly-created temporary job directory."""
     path = Path(path)
     marker = path / _JOB_OWNERSHIP_MARKER
-    marker.write_text(_JOB_OWNERSHIP_VALUE, encoding="utf-8")
+    marker.write_text(_JOB_OWNERSHIP_VALUE, encoding="utf-8", newline="")
+
+
+def is_owned_job_dir(path: Path) -> bool:
+    """Recognize only real directories with a real, exact, bounded ownership marker."""
+    path = Path(path)
+    marker = path / _JOB_OWNERSHIP_MARKER
+    expected = _JOB_OWNERSHIP_VALUE.encode("utf-8")
+    accepted = (expected, expected.replace(b"\n", b"\r\n"))
+    try:
+        if path.is_symlink() or path.is_junction() or not path.is_dir():
+            return False
+        if marker.is_symlink() or marker.is_junction() or not marker.is_file():
+            return False
+        with marker.open("rb") as stream:
+            return stream.read(max(map(len, accepted)) + 1) in accepted
+    except OSError:
+        return False
 
 
 def cleanup_stale_owned_job_dirs(job_root: Path, cutoff_timestamp: float) -> int:
@@ -42,21 +68,16 @@ def cleanup_stale_owned_job_dirs(job_root: Path, cutoff_timestamp: float) -> int
     Unknown directories without a marker are intentionally left untouched.
     """
     root = Path(job_root)
-    if root.is_symlink() or not root.is_dir():
+    if root.is_symlink() or root.is_junction() or not root.is_dir():
         return 0
     root_real = root.resolve(strict=True)
     removed = 0
     for item in root.iterdir():
-        if item.is_symlink() or not item.is_dir() or not item.name.startswith("job-"):
+        if not item.name.startswith("job-") or not is_owned_job_dir(item):
             continue
         try:
             item_real = item.resolve(strict=True)
             if item_real.parent != root_real:
-                continue
-            marker = item / _JOB_OWNERSHIP_MARKER
-            if marker.is_symlink() or not marker.is_file():
-                continue
-            if marker.read_text(encoding="utf-8") != _JOB_OWNERSHIP_VALUE:
                 continue
             if item.stat(follow_symlinks=False).st_mtime < cutoff_timestamp:
                 shutil.rmtree(item)
@@ -92,6 +113,28 @@ def _duration_seconds(value: object) -> int | None:
     return math.ceil(duration) if math.isfinite(duration) and duration > 0 else None
 
 
+def _artist_name(info: dict) -> str:
+    artist = info.get("artist")
+    if isinstance(artist, str) and (name := safe_text(artist, 120)):
+        return name
+    artists = info.get("artists")
+    if isinstance(artists, list):
+        names = list(
+            dict.fromkeys(
+                safe_text(name, 120)
+                for name in artists[:10]
+                if isinstance(name, str) and safe_text(name, 120)
+            )
+        )
+        if names:
+            return safe_text(", ".join(names), 120)
+    for key in ("channel", "uploader", "creator"):
+        name = info.get(key)
+        if isinstance(name, str) and (name := safe_text(name, 120)):
+            return name
+    return "未知频道"
+
+
 def extract_command_argument(message_text: str | None) -> str:
     """Handle both event.message_str variants: with or without the command itself."""
     text = (message_text or "").strip()
@@ -107,42 +150,38 @@ def extract_command_argument(message_text: str | None) -> str:
     return text
 
 
-def parse_youtube_url(value: str) -> str | None:
-    """Return a normalized YouTube URL, or None if value is not an allowed URL."""
-    candidate = (value or "").strip()
-    if not candidate or len(candidate) > 2048:
+def _youtube_parts(value: str):
+    if not isinstance(value, str):
         return None
-
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > 2048
+        or any(ord(char) <= 32 or ord(char) == 127 for char in candidate)
+    ):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    elif any(candidate.casefold().startswith(host + "/") for host in _YOUTUBE_HOSTS):
+        candidate = "https://" + candidate
     try:
         parsed = urlsplit(candidate)
-        hostname = (parsed.hostname or "").lower().rstrip(".")
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or host not in _YOUTUBE_HOSTS
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 443 if parsed.scheme.lower() == "https" else 80}
+        ):
+            return None
     except ValueError:
         return None
-
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return None
-
-    if hostname not in {
-        "youtu.be",
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com",
-        "music.youtube.com",
-    }:
-        return None
-    video_id = youtube_video_id(candidate)
-    return f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+    return parsed
 
 
-def youtube_video_id(value: str) -> str:
-    """Extract a YouTube video ID from a supported watch/short/embed URL."""
-    try:
-        parsed = urlsplit((value or "").strip())
-    except ValueError:
-        return ""
+def _video_id_from_parts(parsed) -> str:
     host = (parsed.hostname or "").lower().rstrip(".")
-    if not (host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")):
-        return ""
     if host == "youtu.be":
         candidate = parsed.path.strip("/").split("/", 1)[0]
     else:
@@ -156,6 +195,19 @@ def youtube_video_id(value: str) -> str:
             )
     # YouTube IDs are normally 11 URL-safe characters. Validate instead of accepting arbitrary path data.
     return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", candidate or "") else ""
+
+
+def parse_youtube_url(value: str) -> str | None:
+    """Normalize only known single-video YouTube URLs, including explicit bare shares."""
+    parsed = _youtube_parts(value)
+    video_id = _video_id_from_parts(parsed) if parsed else ""
+    return f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+
+
+def youtube_video_id(value: str) -> str:
+    """Extract a video identity under the same host policy as URL normalization."""
+    parsed = _youtube_parts(value)
+    return _video_id_from_parts(parsed) if parsed else ""
 
 
 def format_duration(seconds: int | float | None) -> str:
@@ -183,9 +235,7 @@ def song_from_flat_entry(entry: dict) -> Song | None:
     # a canonical watch URL prevents accidentally passing a stream URL back to yt-dlp.
     url = f"https://www.youtube.com/watch?v={video_id}"
     duration = _duration_seconds(entry.get("duration"))
-    artist = str(
-        entry.get("channel") or entry.get("uploader") or entry.get("creator") or "未知频道"
-    ).strip()
+    artist = _artist_name(entry)
     thumbnail = entry.get("thumbnail")
     if not thumbnail and isinstance(entry.get("thumbnails"), list):
         for item in reversed(entry["thumbnails"]):
@@ -195,7 +245,7 @@ def song_from_flat_entry(entry: dict) -> Song | None:
     return Song(
         video_id=video_id,
         title=safe_text(title, 200),
-        artist=safe_text(artist, 120),
+        artist=artist,
         duration=duration,
         url=url,
         thumbnail_url=_safe_thumbnail_url(thumbnail),
@@ -211,9 +261,7 @@ def song_from_full_info(info: dict) -> Song:
     return Song(
         video_id=video_id,
         title=safe_text(info.get("title") or "（无标题）", 200),
-        artist=safe_text(
-            info.get("channel") or info.get("uploader") or info.get("creator") or "未知频道", 120
-        ),
+        artist=_artist_name(info),
         duration=duration,
         url=url,
         thumbnail_url=_safe_thumbnail_url(info.get("thumbnail")),

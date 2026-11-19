@@ -18,6 +18,14 @@ from .service import UserFacingError
 Owner = tuple[str, str]
 
 
+class _SendResourceTimeout(Exception):
+    pass
+
+
+class _SupersededSearch(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class SearchReply:
     owner: Owner
@@ -60,18 +68,31 @@ class SearchRecall:
     def _valid_message_id(value):
         return type(value) is int and value != 0 and -(2**63) <= value < 2**63
 
-    async def _call(self, record, action, **params):
-        async def execute():
-            async with self.semaphore:
-                if self._closed:
-                    raise asyncio.CancelledError
+    async def _call(self, record, action, *, sending=False, **params):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout
+        try:
+            async with asyncio.timeout_at(deadline):
+                await self.semaphore.acquire()
+        except TimeoutError:
+            raise _SendResourceTimeout from None
+        try:
+            if self._closed:
+                raise asyncio.CancelledError
+            if sending and not self.is_current(record.reply.owner, record.reply.token):
+                raise _SupersededSearch
+            if loop.time() >= deadline:
+                raise _SendResourceTimeout
+            async with asyncio.timeout_at(deadline):
                 return await record.api.call_action(action, self_id=record.self_id, **params)
-
-        return await asyncio.wait_for(execute(), self.timeout)
+        finally:
+            self.semaphore.release()
 
     async def send(self, event: AiocqhttpMessageEvent, reply: SearchReply):
         if self._closed:
             raise UserFacingError("插件已停用，未发送搜索结果。")
+        if not self.is_current(reply.owner, reply.token):
+            raise UserFacingError("搜索结果已过期或被替换，未发送旧结果。")
         if not isinstance(event, AiocqhttpMessageEvent):
             raise UserFacingError("无法确认 OneBot 事件，未发送可撤回消息。")
         self_id = event.message_obj.self_id
@@ -95,6 +116,7 @@ class SearchRecall:
             response = await self._call(
                 record,
                 "send_group_msg" if record.group else "send_private_msg",
+                sending=True,
                 **{"group_id" if record.group else "user_id": record.target},
                 message=[{"type": "text", "data": {"text": reply.text}}],
             )
@@ -105,7 +127,7 @@ class SearchRecall:
                     "[YouTubeMusic] search_recall untracked reason=invalid_send_receipt ref=%s",
                     reply.token,
                 )
-                return
+                return False
             record.message_id = response["message_id"]
             if self._closed:
                 return
@@ -115,6 +137,11 @@ class SearchRecall:
             record.task = asyncio.create_task(
                 self._wait_and_recall(key, record), name=f"youtube-search-recall-{reply.token}"
             )
+            return True
+        except _SendResourceTimeout:
+            raise UserFacingError("发送资源繁忙，搜索结果尚未提交，请稍后重新搜索。") from None
+        except _SupersededSearch:
+            raise UserFacingError("搜索结果已过期或被替换，未发送旧结果。") from None
         except TimeoutError:
             logger.warning(
                 "[YouTubeMusic] search_recall send_unknown reason=timeout ref=%s", reply.token

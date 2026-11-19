@@ -13,9 +13,10 @@ from pathlib import Path
 
 from .audio_cache import AudioCache, AudioCacheEntry
 from .errors import UserFacingError as UserFacingError
-from .errors import friendly_process_error
+from .errors import friendly_process_error, transient_network_error
 from .maintenance import run_blocking, uses_dependencies
 from .process import ProcessError, ProcessOutputLimit, ProcessTimeout, run_process
+from .search_quality import is_unavailable_live, rank_search_results
 from .settings import Settings
 from .utils import Song, parse_youtube_url, song_from_flat_entry, song_from_full_info
 
@@ -90,58 +91,74 @@ class YouTubeMusicService:
         monitor_directory: Path | None = None,
         max_directory_size_bytes: int | None = None,
     ):
-        try:
-            return await run_process(
-                [
-                    str(self.settings.yt_dlp_path),
-                    "--ignore-config",
-                    "--no-plugin-dirs",
-                    *self._proxy_args(),
-                    *args,
-                ],
-                timeout=timeout,
-                env=self.child_env(),
-                label=label,
-                on_output_line=on_output_line,
-                monitor_directory=monitor_directory,
-                monitor_pattern="source.*",
-                max_directory_size_bytes=max_directory_size_bytes,
-            )
-        except (ProcessError, ProcessTimeout, ProcessOutputLimit) as exc:
-            raise UserFacingError(
-                self._redact_error(
-                    friendly_process_error(
-                        exc, label, max_download_mb=self.settings.max_download_size_mb
-                    )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        for attempt in range(2):
+            try:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise ProcessTimeout(f"{label}超过总处理时限。")
+                return await run_process(
+                    [
+                        str(self.settings.yt_dlp_path),
+                        "--ignore-config",
+                        "--no-plugin-dirs",
+                        *self._proxy_args(),
+                        *args,
+                    ],
+                    timeout=remaining,
+                    env=self.child_env(),
+                    label=label,
+                    on_output_line=on_output_line,
+                    monitor_directory=monitor_directory,
+                    monitor_pattern="source.*",
+                    max_directory_size_bytes=max_directory_size_bytes,
                 )
-            ) from exc
+            except (ProcessError, ProcessTimeout, ProcessOutputLimit) as exc:
+                if attempt == 0 and transient_network_error(exc):
+                    remaining = deadline - loop.time()
+                    if remaining > 0.5:
+                        await asyncio.sleep(0.5)
+                        continue
+                raise UserFacingError(
+                    self._redact_error(
+                        friendly_process_error(
+                            exc, label, max_download_mb=self.settings.max_download_size_mb
+                        )
+                    )
+                ) from exc
 
-    @staticmethod
-    def _search_relevance(query: str, song: Song) -> float:
-        """Deterministic title/artist relevance score; YouTube order remains the tie-breaker."""
-        import re
-
-        normalized = " ".join(re.findall(r"[\w\u4e00-\u9fff]+", str(query).casefold()))
-        title = " ".join(re.findall(r"[\w\u4e00-\u9fff]+", str(song.title).casefold()))
-        artist = " ".join(re.findall(r"[\w\u4e00-\u9fff]+", str(song.artist).casefold()))
-        if not normalized:
-            return 0.0
-        score = 0.0
-        if normalized in title:
-            score += 8.0
-        if title.startswith(normalized):
-            score += 2.0
-        tokens = [token for token in normalized.split() if len(token) > 1]
-        for token in tokens:
-            if token in title:
-                score += 2.0
-            elif token in artist:
-                score += 1.25
-        if tokens:
-            score += (
-                3.0 * sum(1 for token in tokens if token in title or token in artist) / len(tokens)
+    def preflight(
+        self,
+        song: Song,
+        *,
+        max_duration_seconds: int | None = None,
+        voice: bool = True,
+    ) -> int:
+        """Reject known duration and PCM size violations before admitting network work."""
+        duration_cap = (
+            min(self.settings.max_duration_seconds, max(15, int(max_duration_seconds)))
+            if max_duration_seconds is not None
+            else self.settings.max_duration_seconds
+        )
+        if (
+            not isinstance(song, Song)
+            or not isinstance(song.duration, int)
+            or isinstance(song.duration, bool)
+            or song.duration <= 0
+        ):
+            raise UserFacingError("歌曲时长未知或无效，已拒绝下载。")
+        if song.duration > duration_cap:
+            raise UserFacingError(
+                f"歌曲时长为 {song.duration} 秒，超过当前上限 {duration_cap} 秒。"
             )
-        return score
+        max_wav_bytes = self.settings.max_wav_size_mb * 1024 * 1024
+        if voice and song.duration * 16000 * 2 + 4096 > max_wav_bytes:
+            maximum = max(1, (max_wav_bytes - 4096) // (16000 * 2))
+            raise UserFacingError(
+                f"预计 WAV 超过 {self.settings.max_wav_size_mb} MiB，上限约 {maximum} 秒。"
+            )
+        return duration_cap
 
     @uses_dependencies
     async def search(
@@ -150,7 +167,10 @@ class YouTubeMusicService:
         *,
         max_duration_seconds: int | None = None,
         result_limit: int | None = None,
+        candidate_pool: bool = False,
     ) -> list[Song]:
+        if not isinstance(query, str):
+            raise UserFacingError("请提供要搜索的歌曲关键词。")
         query = query.strip()
         if not query:
             raise UserFacingError("请提供要搜索的歌曲关键词。")
@@ -193,20 +213,22 @@ class YouTubeMusicService:
             raise UserFacingError("搜索结果解析失败，请检查 yt-dlp。") from exc
 
         entries = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or entries is not None and not isinstance(entries, list):
+            raise UserFacingError("搜索结果结构无效，请检查 yt-dlp。")
         songs: list[Song] = []
         seen_ids: set[str] = set()
         for entry in entries or []:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or is_unavailable_live(entry):
                 continue
             song = song_from_flat_entry(entry)
             if not song or song.video_id in seen_ids:
                 continue
-            seen_ids.add(song.video_id)
             if song.duration is None or song.duration <= 0 or song.duration > duration_cap:
                 continue
+            seen_ids.add(song.video_id)
             songs.append(song)
-        songs.sort(key=lambda item: self._search_relevance(query, item), reverse=True)
-        return songs[:result_count]
+        songs = rank_search_results(query, songs)
+        return songs[: fetch_count if candidate_pool else result_count]
 
     @uses_dependencies
     async def get_metadata(self, url: str, *, max_duration_seconds: int | None = None) -> Song:
@@ -234,6 +256,8 @@ class YouTubeMusicService:
             raise UserFacingError("yt-dlp 没有返回可识别的视频信息。") from exc
         if not isinstance(info, dict) or info.get("_type") == "playlist":
             raise UserFacingError("仅支持单个视频，不支持播放列表。")
+        if is_unavailable_live(info):
+            raise UserFacingError("正在直播或预约的视频暂不支持点播，请选择已发布的歌曲。")
         try:
             song = song_from_full_info(info)
         except ValueError as exc:
@@ -264,17 +288,21 @@ class YouTubeMusicService:
         max_duration_seconds: int | None = None,
     ) -> tuple[Path, Song, dict]:
         """Use a validated cached WAV when available, otherwise download, convert and cache it."""
-        duration_cap = (
-            min(self.settings.max_duration_seconds, max(15, int(max_duration_seconds)))
-            if max_duration_seconds is not None
-            else self.settings.max_duration_seconds
-        )
+        duration_cap = self.preflight(song, max_duration_seconds=max_duration_seconds)
+        waiting = self._cache_locks.get(song.video_id)
+        if on_stage and waiting is not None and waiting.lock.locked():
+            on_stage("等待歌曲缓存")
         async with self._lock_for(song.video_id):
             cached = await self._validated_cache_entry(
-                song.video_id, on_stage=on_stage, max_duration_seconds=duration_cap
+                song.video_id,
+                job_dir=job_dir,
+                on_stage=on_stage,
+                max_duration_seconds=duration_cap,
             )
             if cached:
                 return cached.path, cached.song, cached.media
+            if on_stage:
+                on_stage("读取视频信息")
             resolved = await self.get_metadata(song.url, max_duration_seconds=duration_cap)
             if resolved.video_id != song.video_id:
                 raise UserFacingError("视频身份与点播项不一致，已拒绝下载。")
@@ -302,12 +330,21 @@ class YouTubeMusicService:
         self,
         video_id: str,
         *,
+        job_dir: Path,
         on_stage: StageCallback | None,
         max_duration_seconds: int | None = None,
     ) -> AudioCacheEntry | None:
         if not self.audio_cache:
             return None
-        entry = await run_blocking(self.audio_cache.lookup, video_id)
+        try:
+            entry = await run_blocking(
+                self.audio_cache.copy_for_job,
+                video_id,
+                job_dir,
+                max_size_bytes=self.settings.max_wav_size_mb * 1024 * 1024,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise UserFacingError("无法准备歌曲临时音频，请检查缓存与任务目录。") from exc
         if not entry:
             return None
         if on_stage:
@@ -336,7 +373,12 @@ class YouTubeMusicService:
                 }
             )
             return entry
-        except (OSError, ValueError, TypeError, UserFacingError):
+        except UserFacingError as exc:
+            if isinstance(exc.__cause__, ProcessError):
+                raise
+            await run_blocking(self.audio_cache.invalidate, video_id)
+            return None
+        except (OSError, ValueError, TypeError):
             await run_blocking(self.audio_cache.invalidate, video_id)
             return None
 
@@ -349,11 +391,7 @@ class YouTubeMusicService:
         on_stage: StageCallback | None,
         max_duration_seconds: int | None = None,
     ) -> tuple[Path, Song, dict]:
-        duration_cap = (
-            min(self.settings.max_duration_seconds, max(15, int(max_duration_seconds)))
-            if max_duration_seconds is not None
-            else self.settings.max_duration_seconds
-        )
+        duration_cap = self.preflight(resolved, max_duration_seconds=max_duration_seconds)
         job_dir.mkdir(parents=True, exist_ok=True)
         output_template = str(job_dir / "source.%(ext)s")
         max_source_bytes = self.settings.max_download_size_mb * 1024 * 1024
@@ -506,7 +544,6 @@ class YouTubeMusicService:
             cached_path = await run_blocking(self.audio_cache.store, resolved, wav_path, media)
             if cached_path:
                 media["cache_stored"] = True
-                return cached_path, resolved, media
         return wav_path, resolved, media
 
     @staticmethod

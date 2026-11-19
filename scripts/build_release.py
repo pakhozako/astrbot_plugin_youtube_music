@@ -70,6 +70,7 @@ FILES = (
     "core/persistence.py",
     "core/process.py",
     "core/queue.py",
+    "core/search_quality.py",
     "core/search_recall.py",
     "core/service.py",
     "core/settings.py",

@@ -5,7 +5,7 @@
   "send_strategy": {"description": "发送策略", "type": "string", "default": "voice_then_link", "options": ["voice_only", "voice_then_link", "link_only"], "hint": "语音失败时可提交视频链接；超时结果未知，不自动回退。链接不计入语音历史。"},
   "youtube_proxy": {"description": "YouTube 代理", "type": "string", "default": "", "secret": true, "hint": "http、https 或 socks5 代理地址。留空使用系统代理；内容不会返回 WebUI。"},
   "dependency_proxy": {"description": "依赖下载代理", "type": "string", "default": "", "secret": true, "hint": "http 或 https 代理地址。留空使用默认连接；内容不会返回 WebUI。"},
-  "search_results": {"description": "候选歌曲数", "type": "int", "default": 5, "slider": {"min": 3, "max": 10, "step": 1}},
+  "search_results": {"description": "候选歌曲数", "type": "int", "default": 5, "slider": {"min": 3, "max": 10, "step": 1}, "hint": "群聊每页显示数量，复用一次搜索的候选池，最多三页。AI Tool 与控制台的默认结果数量不变。"},
   "result_ttl_minutes": {"description": "候选有效期（分钟）", "type": "int", "default": 15, "slider": {"min": 1, "max": 120, "step": 1}},
   "max_duration_seconds": {"description": "音频时长上限（秒）", "type": "int", "default": 180, "slider": {"min": 15, "max": 900, "step": 15}},
   "max_download_size_mb": {"description": "源媒体大小上限（MiB）", "type": "int", "default": 50, "slider": {"min": 5, "max": 500, "step": 5}},

@@ -215,6 +215,72 @@ class RecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.manager._records)
         self.assertFalse(self.actions("delete_msg"))
 
+    async def test_obsolete_reply_is_rejected_before_capacity_or_network_work(self):
+        old = self.reply()
+        self.reply(old.owner)
+        with self.assertRaisesRegex(UserFacingError, "旧结果"):
+            await self.manager.send(qq_event(self.api), old)
+        self.assertFalse(self.api.calls)
+        self.assertFalse(self.manager._records)
+
+    async def test_reply_superseded_while_waiting_for_send_gate_is_never_submitted(self):
+        await self.manager.semaphore.acquire()
+        old = self.reply()
+        task = asyncio.create_task(self.manager.send(qq_event(self.api), old))
+        await asyncio.sleep(0)
+        self.assertIn((old.owner, old.token), self.manager._records)
+        self.reply(old.owner)
+        self.manager.semaphore.release()
+        with self.assertRaisesRegex(UserFacingError, "旧结果"):
+            await task
+        self.assertFalse(self.api.calls)
+        self.assertFalse(self.manager._records)
+        self.assertEqual(self.manager.semaphore._value, 1)
+
+    async def test_reply_expired_while_waiting_for_send_gate_is_never_submitted(self):
+        await self.manager.semaphore.acquire()
+        old = self.reply()
+        task = asyncio.create_task(self.manager.send(qq_event(self.api), old))
+        await asyncio.sleep(0)
+        self.current.pop(old.owner)
+        self.manager.semaphore.release()
+        with self.assertRaisesRegex(UserFacingError, "旧结果"):
+            await task
+        self.assertFalse(self.api.calls)
+        self.assertFalse(self.manager._records)
+
+    async def test_send_gate_timeout_is_not_an_unknown_api_submission(self):
+        await self.manager.semaphore.acquire()
+        self.manager.timeout = 0.01
+        try:
+            with self.assertRaisesRegex(UserFacingError, "尚未提交") as error:
+                await self.manager.send(qq_event(self.api), self.reply())
+            self.assertNotIn("结果未知", str(error.exception))
+            self.assertEqual(self.manager.semaphore._value, 0)
+        finally:
+            self.manager.semaphore.release()
+        self.assertFalse(self.api.calls)
+        self.assertFalse(self.manager._records)
+        self.assertEqual(self.manager.semaphore._value, 1)
+
+    async def test_cancelling_send_gate_wait_does_not_leak_a_reserved_slot(self):
+        await self.manager.semaphore.acquire()
+        task = asyncio.create_task(self.manager.send(qq_event(self.api), self.reply()))
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.manager.semaphore.release()
+        self.assertEqual(self.manager.semaphore._value, 1)
+        self.assertFalse(self.api.calls)
+        self.assertFalse(self.manager._records)
+
+    async def test_invalid_receipt_reports_untracked_submission_without_resending(self):
+        self.api.receipt = None
+        self.assertFalse(await self.manager.send(qq_event(self.api), self.reply()))
+        self.assertEqual(len(self.actions("send_group_msg")), 1)
+        self.assertFalse(self.manager._records)
+
     async def test_selection_during_pending_send_is_not_lost(self):
         self.api.block = "send_group_msg"
         self.manager.delay = 60
@@ -399,6 +465,45 @@ class PluginRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.command("Track")), 1)
         self.assertFalse(self.api.calls)
         self.assertFalse(self.plugin._search_recall._records)
+
+    async def test_failed_search_send_invalidates_unseen_candidates_but_keeps_retry_query(self):
+        import test_runtime
+
+        self.api.fail = "send_group_msg"
+        self.assertEqual(len(await self.command("Track")), 1)
+        with self.assertRaises(test_runtime.module.UserFacingError):
+            self.plugin.candidate(self.owner, 1)
+        self.assertEqual(self.plugin._candidates[self.owner]["query"], "Track")
+        self.api.fail = ""
+        self.assertEqual(await self.command("重搜"), [])
+        self.assertEqual(self.plugin.candidate(self.owner, 1), self.song)
+
+    async def test_unknown_send_receipt_does_not_leave_candidates_selectable(self):
+        self.api.receipt = None
+        self.assertEqual(await self.command("Track"), [])
+        self.assertFalse(self.plugin._candidates[self.owner]["selectable"])
+        self.assertFalse(self.plugin._search_recall._records)
+        self.assertEqual(len(self.api.calls), 1)
+
+    async def test_old_send_failure_does_not_invalidate_new_generation(self):
+        import test_runtime
+
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def failed_send(event, reply):
+            entered.set()
+            await release.wait()
+            raise test_runtime.module.UserFacingError("Search send failure")
+
+        with patch.object(self.plugin._search_recall, "send", side_effect=failed_send):
+            old = asyncio.create_task(self.command("Old search"))
+            await entered.wait()
+            new_reply = await self.plugin.dispatch_music(self.event, "New search")
+            release.set()
+            self.assertEqual(len(await old), 1)
+        self.assertEqual(self.plugin._candidates[self.owner]["token"], new_reply.token)
+        self.assertTrue(self.plugin._candidates[self.owner]["selectable"])
+        self.assertEqual(self.plugin.candidate(self.owner, 1), self.song)
 
     async def test_ai_search_is_not_registered_as_a_recallable_llm_reply(self):
         await self.plugin.ai_music_action(self.event, "search", "Track")

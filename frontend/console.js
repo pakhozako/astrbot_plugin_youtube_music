@@ -490,8 +490,16 @@ function drawQueue() {
   $("queue-idle").hidden = Boolean(current);
   if (current) {
     const info = details(current.row.song);
-    const phase = { "下载音轨": t("downloadAudio", "下载音轨"), "转换为 WAV": t("convertWav", "转换为 WAV") }[current.phase] || current.phase;
-    info.prepend(element("div", "phase", phase));
+    const phases = new Map([
+      ["等待处理", ["phaseProcessingWait", "等待处理"]], ["等待歌曲缓存", ["phaseCacheWait", "等待歌曲缓存"]],
+      ["读取视频信息", ["phaseMetadata", "读取视频信息"]], ["校验已缓存音频", ["phaseCacheCheck", "校验已缓存音频"]],
+      ["下载音轨", ["downloadAudio", "下载音轨"]], ["检查源音频", ["phaseSourceCheck", "检查源音频"]],
+      ["转换为 WAV", ["convertWav", "转换为 WAV"]], ["验证 WAV 编码与时长", ["phaseWavCheck", "验证 WAV 编码与时长"]],
+      ["写入歌曲缓存", ["phaseCacheWrite", "写入歌曲缓存"]], ["提交消息", ["phaseMessageSend", "提交消息"]],
+      ["已提交语音", ["phaseVoiceSubmitted", "已提交语音"]], ["已提交链接", ["phaseLinkSubmitted", "已提交链接"]],
+    ]);
+    const phase = phases.get(current.phase);
+    info.prepend(element("div", "phase", phase ? t(...phase) : current.phase));
     replaceContent($("now-playing"), artwork(current.row.song), info);
   }
   const rows = items.map((item, index) => {

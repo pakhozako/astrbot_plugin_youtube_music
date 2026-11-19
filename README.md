@@ -1,10 +1,10 @@
 # AstrBot YouTube Music
 
 [![CI](https://github.com/pakhozako/astrbot_plugin_youtube_music/actions/workflows/ci.yml/badge.svg)](https://github.com/pakhozako/astrbot_plugin_youtube_music/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.0-green)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.0-green)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**在 QQ 中点歌，在 AstrBot 中管理音乐。**
+**在 QQ 群聊中选歌、排队，以语音分享音乐。**
 
 搜索 YouTube 歌曲、选择候选并加入群聊共享队列，以语音分享音乐。Material Design 3 控制台将搜索、队列、收藏、历史与依赖维护集中在一个清晰的界面中。
 
@@ -14,8 +14,10 @@ A YouTube music request plugin for AstrBot, with shared QQ queues and a Material
 
 ## 核心功能
 
-- **搜索点歌**：按关键词查找歌曲，查看歌手与时长，使用候选编号或视频链接点歌。
-- **共享队列**：按顺序处理歌曲，查看待播总时长，支持暂停、继续、下一首、取消、移除和调整顺序。
+- **搜索点歌**：多关键词与版本识别，分页查看候选，按编号或 YouTube 分享链接点歌；详情按需展示封面。
+- **群聊隔离**：搜索列表属于当前用户和群聊；可用结果码绑定选歌，重新搜索和取消搜索不影响其他成员。
+- **共享队列**：展示点歌者、处理阶段和待播总时长，支持暂停、继续、下一首、取消、移除和调整顺序。
+- **个人重播**：从自己的最近语音历史重播，或从个人收藏与历史中随机点歌。
 - **音乐库**：分页浏览收藏与语音提交历史，筛选、排序、从历史收藏歌曲，跨页选择最多 20 首并整批入队。
 - **搜索结果自动撤回**：按配置的延迟清理搜索结果消息。
 - **AI Tool**：通过 `youtube_music` 在对话中搜索和管理当前会话的音乐队列。

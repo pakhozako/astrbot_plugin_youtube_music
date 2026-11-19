@@ -417,6 +417,52 @@ test("active item is protected and its phase is visible on mobile", async ({ pag
   await page.screenshot({ path: `${screenshots}/${info.project.name}-active-queue-viewport.png`, animations: "disabled" });
 });
 
+test("playback phases follow locale changes and fit every viewport", async ({ page }, info) => {
+  const phases = [
+    ["等待处理", "Waiting for resources"], ["等待歌曲缓存", "Waiting for song cache"],
+    ["读取视频信息", "Reading video information"], ["校验已缓存音频", "Validating cached audio"],
+    ["下载音轨", "Downloading audio"], ["检查源音频", "Checking source audio"],
+    ["转换为 WAV", "Converting to WAV"], ["验证 WAV 编码与时长", "Validating WAV encoding and duration"],
+    ["写入歌曲缓存", "Saving song cache"], ["提交消息", "Sending message"],
+    ["已提交语音", "Voice submitted"], ["已提交链接", "Link submitted"],
+  ];
+  await page.evaluate(() => {
+    const queue = window.mockControl.fixtures.queues["session-a"];
+    queue.current = { row: queue.items[0], phase: "等待处理", submitted: false };
+    queue.paused = false;
+  });
+  await page.locator("#refresh").click();
+  await queueView(page);
+  const phaseLabel = page.locator("#now-playing .phase");
+  for (const [source, translated] of phases) {
+    await page.evaluate((phase) => {
+      window.mockControl.fixtures.queues["session-a"].current.phase = phase;
+      window.mockControl.notify();
+    }, source);
+    await expect(phaseLabel).toHaveText(source);
+    await page.evaluate(() => window.mockControl.locale("en-US"));
+    await expect(phaseLabel).toHaveText(translated);
+    expect(await phaseLabel.evaluate((node) => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
+    await page.evaluate(() => window.mockControl.locale("zh-CN"));
+    await expect(phaseLabel).toHaveText(source);
+  }
+  await page.evaluate(() => {
+    window.mockControl.fixtures.queues["session-a"].current.phase = "Custom <phase>";
+    window.mockControl.notify();
+  });
+  await expect(phaseLabel).toHaveText("Custom <phase>");
+  await expect(phaseLabel.locator("phase")).toHaveCount(0);
+  await page.evaluate(() => {
+    window.mockControl.fixtures.queues["session-a"].current.phase = "验证 WAV 编码与时长";
+    window.mockControl.notify();
+  });
+  await expect(phaseLabel).toHaveText("验证 WAV 编码与时长");
+  await page.evaluate(() => window.mockControl.locale("en-US"));
+  await expect(phaseLabel).toHaveText("Validating WAV encoding and duration");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: `${screenshots}/${info.project.name}-queue-progress-en-US.png`, animations: "disabled" });
+});
+
 test("library filtering and sorting preserve exact video IDs and sources", async ({ page }, info) => {
   await page.evaluate(() => {
     const control = window.mockControl;

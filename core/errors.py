@@ -2,11 +2,66 @@
 
 from __future__ import annotations
 
+import re
+
 from .process import ProcessCaptureLimit, ProcessError, ProcessOutputLimit, ProcessTimeout
 
 
 class UserFacingError(RuntimeError):
     """An expected error suitable for displaying to the user."""
+
+
+def transient_network_error(exc: BaseException) -> bool:
+    """Retry only explicit, temporary network failures, never ambiguous or policy failures."""
+    if not isinstance(exc, ProcessError) or isinstance(exc, (ProcessTimeout, ProcessOutputLimit)):
+        return False
+    text = str(exc).casefold()
+    if any(
+        marker in text
+        for marker in (
+            "429",
+            "rate limit",
+            "too many requests",
+            "timed out",
+            "timeout",
+            "login required",
+            "sign in",
+            "confirm your age",
+            "age-restricted",
+            "private video",
+            "video unavailable",
+            "video is unavailable",
+            "video is not available",
+            "video has been removed",
+            "not available in your country",
+            "not available in your region",
+            "geo-restricted",
+            "geographic restriction",
+            "blocked in your country",
+            "country restriction",
+            "requested format is not available",
+            "max-filesize",
+            "size limit",
+            "javascript challenge",
+            "js challenge",
+            "challenge solver",
+            "signature extraction failed",
+        )
+    ):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "connection reset",
+            "connection aborted",
+            "temporary failure in name resolution",
+            "eai_again",
+            "remote end closed connection",
+            "remote disconnected",
+            "server disconnected",
+            "connection was forcibly closed",
+        )
+    ) or bool(re.search(r"\b(?:http(?:\s+error)?|status(?:\s+code)?)[:\s]+5\d\d\b", text))
 
 
 def friendly_process_error(
@@ -52,6 +107,8 @@ def friendly_process_error(
         )
     ):
         return "该视频存在地区限制，当前运行环境无法访问。"
+    if "requested format is not available" in text:
+        return "视频没有符合要求的可用音轨，请更换视频或检查 yt-dlp。"
     if any(
         marker in text
         for marker in (
