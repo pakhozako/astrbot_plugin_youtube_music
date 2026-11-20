@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from aiocqhttp.exceptions import NetworkError
 from astrbot.api import logger
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
@@ -142,11 +143,13 @@ class SearchRecall:
             raise UserFacingError("发送资源繁忙，搜索结果尚未提交，请稍后重新搜索。") from None
         except _SupersededSearch:
             raise UserFacingError("搜索结果已过期或被替换，未发送旧结果。") from None
-        except TimeoutError:
+        except (TimeoutError, NetworkError, ConnectionError) as exc:
             logger.warning(
-                "[YouTubeMusic] search_recall send_unknown reason=timeout ref=%s", reply.token
+                "[YouTubeMusic] search_recall send_unknown error=%s ref=%s",
+                type(exc).__name__,
+                reply.token,
             )
-            raise UserFacingError("搜索结果提交超时，结果未知。请核对 QQ 消息。") from None
+            raise UserFacingError("搜索结果提交异常，结果未知。请核对 QQ 消息。") from None
         except asyncio.CancelledError:
             raise
         except Exception as exc:

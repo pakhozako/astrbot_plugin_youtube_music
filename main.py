@@ -16,6 +16,7 @@ from pathlib import Path
 
 import aiohttp
 import astrbot.api.message_components as Comp
+from aiocqhttp.exceptions import NetworkError
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
@@ -53,6 +54,7 @@ HELP_TEXT = """YouTube 点歌
 /点歌 重搜 [关键词] / 取消搜索
 /点歌 详情 <编号> [结果码]：歌曲信息与封面
 /点歌 队列 / 状态：查看队列
+/点歌 我的队列：查看本人的待播与当前歌曲
 /点歌 收藏 <编号> [结果码] / 收藏列表 / 播放收藏 <编号>
 /点歌 取消收藏 <编号> / 最近 / 清除历史
 /点歌 重播 [历史编号] / 随机：个人收藏与历史
@@ -94,7 +96,10 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         self._candidates: OrderedDict[tuple[str, str], dict] = OrderedDict()
         self._search_busy: set[tuple[str, str]] = set()
         self._search_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._search_deliveries: dict[tuple[str, str], dict] = {}
         self._history_views: OrderedDict[tuple[str, str], dict] = OrderedDict()
+        self._favorite_views: OrderedDict[tuple[str, str], tuple[str, ...]] = OrderedDict()
+        self._favorite_views_limited = False
         self._running = False
         self._terminating = False
         self._search_recall = SearchRecall(
@@ -180,7 +185,9 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         self._candidates.clear()
         self._search_busy.clear()
         self._search_tasks.clear()
+        self._search_deliveries.clear()
         self._history_views.clear()
+        self._favorite_views.clear()
         if self.audio_cache is not None:
             self.audio_cache.protected_video_ids = set()
 
@@ -333,10 +340,21 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
 
     async def _cancel_search(self, owner):
         task = self._search_tasks.get(owner)
-        if task is None or task.done() or task is asyncio.current_task():
+        active = task is not None and not task.done() and task is not asyncio.current_task()
+        delivery = self._search_deliveries.get(owner)
+        pending_reply = delivery is not None and not delivery["cancelled"]
+        if not active and not pending_reply:
             return "你没有进行中的搜索。"
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        if pending_reply:
+            # Preserve late API receipts instead of interrupting a possibly submitted call.
+            delivery["cancelled"] = True
+            self._invalidate_search_reply(delivery["reply"])
+            self._search_recall.supersede(owner)
+        if active:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if pending_reply:
+            return "已取消你的搜索，待播队列未改变；若结果已提交且收到可核对回执，将尝试撤回。"
         return "已取消你的搜索，待播队列未改变。"
 
     def _invalidate_search_reply(self, reply):
@@ -406,6 +424,25 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
             raise UserFacingError("历史编号无效或已过期，请先发送 /点歌 最近。")
         song = view["songs"][index - 1]
         songs = await run_blocking(self.library.songs_for_source, owner, "history", [song.video_id])
+        return songs[0]
+
+    async def _favorite_song(self, owner, index):
+        if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+            raise UserFacingError("收藏编号无效。")
+        view = self._favorite_views.get(owner)
+        if view is None:
+            if self._favorite_views_limited:
+                raise UserFacingError("请先查看 /点歌 收藏列表，再按展示编号操作。")
+            songs = await run_blocking(self.library.favorites, owner)
+            if index > len(songs):
+                raise UserFacingError("收藏编号无效。")
+            return songs[index - 1]
+        if index > len(view):
+            raise UserFacingError("收藏编号无效，请重新查看 /点歌 收藏列表。")
+        self._favorite_views.move_to_end(owner)
+        songs = await run_blocking(
+            self.library.songs_for_source, owner, "favorites", [view[index - 1]]
+        )
         return songs[0]
 
     async def _random_song(self, key, owner):
@@ -678,9 +715,13 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
     async def _send_song(self, session, song, wav):
         async with self.service._stage_limit("send_concurrency", self.settings.send_concurrency):
             if self.settings.send_strategy == "link_only":
-                await self._send(
-                    session["umo"], MessageChain().message(f"{safe_text(song.title)}\n{song.url}")
-                )
+                try:
+                    await self._send(
+                        session["umo"],
+                        MessageChain().message(f"{safe_text(song.title)}\n{song.url}"),
+                    )
+                except (TimeoutError, NetworkError, ConnectionError):
+                    raise UserFacingError("链接提交异常，结果未知。请核对消息后再点播。") from None
                 return False
             path = str(wav.resolve())
             try:
@@ -688,16 +729,21 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                     session["umo"], MessageChain(chain=[Comp.Record(file=path, url=path)])
                 )
                 return True
-            except TimeoutError:
-                # A timeout is ambiguous: do not send a second message automatically.
-                raise UserFacingError("语音提交超时，结果未知。请核对消息后再点播。") from None
+            except (TimeoutError, NetworkError, ConnectionError):
+                # A lost receipt is ambiguous: do not submit a second message.
+                raise UserFacingError("语音提交异常，结果未知。请核对消息后再点播。") from None
             except Exception:
                 if self.settings.send_strategy != "voice_then_link":
                     raise
-                await self._send(
-                    session["umo"],
-                    MessageChain().message(f"语音提交失败：{safe_text(song.title)}\n{song.url}"),
-                )
+                try:
+                    await self._send(
+                        session["umo"],
+                        MessageChain().message(
+                            f"语音提交失败：{safe_text(song.title)}\n{song.url}"
+                        ),
+                    )
+                except (TimeoutError, NetworkError, ConnectionError):
+                    raise UserFacingError("链接提交异常，结果未知。请核对消息后再点播。") from None
                 return False
 
     async def _queue_worker(self, key):
@@ -809,16 +855,18 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
             except Exception as save_error:
                 logger.error("[YouTubeMusic] 暂停状态保存失败：%s", type(save_error).__name__)
         finally:
-            if job:
-                await run_blocking(self._cleanup_job, job)
-            self._current.pop(key, None)
-            self._workers.pop(key, None)
-            self.audio_cache.protected_video_ids = {
-                item["row"]["song"]["video_id"] for item in self._current.values()
-            }
-            self._broadcast()
-            if key not in self._errors and not self._terminating:
-                self._start_worker(key)
+            try:
+                if job:
+                    await run_blocking(self._cleanup_job, job)
+            finally:
+                self._current.pop(key, None)
+                self._workers.pop(key, None)
+                self.audio_cache.protected_video_ids = {
+                    item["row"]["song"]["video_id"] for item in self._current.values()
+                }
+                self._broadcast()
+                if key not in self._errors and not self._terminating:
+                    self._start_worker(key)
 
     async def queue_action(
         self, key, action, *, owner=None, admin=False, entry_id="", direction=""
@@ -959,6 +1007,54 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
             lines.append(self._errors[key])
         return "\n".join(lines)
 
+    def personal_queue_text(self, key, owner):
+        payload = self.state.snapshot()
+        rows = payload["queues"].get(key, [])
+        owner_id = self.library.owner_id(owner)
+        current = self._current.get(key)
+        own_current = current if current and current["row"]["owner"] == owner_id else None
+        current_id = own_current["row"]["id"] if own_current else None
+        mine = [
+            (index, row)
+            for index, row in enumerate(rows, 1)
+            if row["owner"] == owner_id and row["id"] != current_id
+        ]
+        status = (
+            "已暂停"
+            if key in payload["paused"] or key in self._errors
+            else "运行中"
+            if key in self._workers
+            else "待启动"
+        )
+        summary = pending_queue_summary([row for _, row in mine])
+        lines = [
+            f"我的点歌队列 · QQ {safe_text(owner[1], 24)} · {status}",
+            f"本人待播 {summary['count']} 首 · 总时长 {format_duration(summary['duration_seconds'])}",
+        ]
+        if summary["unknown_duration_count"]:
+            lines[-1] += f"（{summary['unknown_duration_count']} 首时长未知）"
+        if own_current:
+            row = own_current["row"]
+            song = row["song"]
+            position = next(
+                (index for index, entry in enumerate(rows, 1) if entry["id"] == current_id), None
+            )
+            label = f"当前 #{position}" if position is not None else "当前"
+            lines.append(
+                f"{label} · {safe_text(own_current['phase'], 60)}：{safe_text(song['title'])} · "
+                f"{safe_text(song['artist'], 60)} · {format_duration(song['duration'])}"
+            )
+        lines.extend(
+            f"{index}. {safe_text(row['song']['title'])} · {safe_text(row['song']['artist'], 60)} · "
+            f"{format_duration(row['song']['duration'])}"
+            for index, row in mine
+        )
+        if not mine:
+            lines.append("你没有待播歌曲。")
+        if key in self._errors:
+            lines.append("群队列处理异常，等待管理员核对后继续。")
+        return "\n".join(lines)
+
     async def dispatch_music(self, event, argument):
         async with self.operation():
             key, owner, admin = await self._event_identity(event)
@@ -966,6 +1062,8 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 return HELP_TEXT
             if argument in {"队列", "状态"}:
                 return self.queue_text(key)
+            if argument == "我的队列":
+                return self.personal_queue_text(key, owner)
             if argument == "取消搜索":
                 return await self._cancel_search(owner)
             if argument in {"下一页", "上一页"} or argument.startswith("翻页 "):
@@ -1010,6 +1108,12 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 return "已移除待播歌曲。"
             if argument == "收藏列表":
                 songs = await run_blocking(self.library.favorites, owner)
+                self._favorite_views[owner] = tuple(song.video_id for song in songs)
+                self._favorite_views.move_to_end(owner)
+                while len(self._favorite_views) > 500:
+                    self._favorite_views.popitem(last=False)
+                    # After any eviction, absence cannot distinguish an unseen list from a stale one.
+                    self._favorite_views_limited = True
                 return self.song_list(songs) or "暂无收藏。"
             if argument == "最近":
                 rows = await run_blocking(self.library.history, owner)
@@ -1031,13 +1135,12 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
                 return "已收藏。" if added else "已在收藏中。"
             selected_token = None
             if argument.startswith(("播放收藏 ", "取消收藏 ")):
-                songs = await run_blocking(self.library.favorites, owner)
                 index = self._index(argument[5:])
-                if not 1 <= index <= len(songs):
-                    raise UserFacingError("收藏编号无效。")
-                song = songs[index - 1]
+                song = await self._favorite_song(owner, index)
                 if argument.startswith("取消"):
-                    await run_blocking(self.library.remove_favorite, owner, song.video_id)
+                    removed = await run_blocking(self.library.remove_favorite, owner, song.video_id)
+                    if not removed:
+                        raise UserFacingError("歌曲已不在收藏中，请重新查看 /点歌 收藏列表。")
                     return "已移除收藏。"
             elif argument == "重播" or argument.startswith("重播 "):
                 index = self._index(argument[3:]) if argument.startswith("重播 ") else None
@@ -1080,13 +1183,18 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def song_command(self, event: AstrMessageEvent):
         search_reply = None
+        delivery = None
         try:
             result = await self.dispatch_music(event, extract_command_argument(event.message_str))
             if isinstance(result, SearchReply):
                 search_reply = result
                 if self.settings.search_result_auto_recall:
+                    delivery = {"reply": result, "cancelled": False}
+                    self._search_deliveries[result.owner] = delivery
                     async with self.operation():
                         sent = await self._search_recall.send(event, result)
+                    if delivery["cancelled"]:
+                        return
                     if sent is False:
                         self._invalidate_search_reply(result)
                     return
@@ -1103,12 +1211,17 @@ class YouTubeMusicPlugin(WebUIMixin, Star):
         except Exception as exc:
             if search_reply:
                 self._invalidate_search_reply(search_reply)
+            if delivery and delivery["cancelled"]:
+                return
             logger.error("[YouTubeMusic] 点歌请求失败：%s", type(exc).__name__)
             result = (
                 safe_text(str(exc), 200)
                 if isinstance(exc, UserFacingError)
                 else "请求未完成，请查看插件日志。"
             )
+        finally:
+            if delivery and self._search_deliveries.get(search_reply.owner) is delivery:
+                self._search_deliveries.pop(search_reply.owner, None)
         yield event.plain_result(result)
 
     async def ai_music_action(self, event, action, query="", index=0):

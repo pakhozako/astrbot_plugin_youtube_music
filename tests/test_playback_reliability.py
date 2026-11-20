@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import json
 import os
 import tempfile
 import threading
@@ -12,10 +13,16 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from filesystem_helpers import directory_link
 
-from core.audio_cache import AudioCache
+from core.audio_cache import AudioCache, AudioCacheEntry
 from core.errors import UserFacingError, friendly_process_error, transient_network_error
 from core.maintenance import MaintenanceGate, run_blocking
-from core.process import ProcessError, ProcessOutputLimit, ProcessResult, ProcessTimeout
+from core.process import (
+    ProcessError,
+    ProcessExitError,
+    ProcessOutputLimit,
+    ProcessResult,
+    ProcessTimeout,
+)
 from core.service import YouTubeMusicService
 from core.settings import Settings
 from core.utils import Song
@@ -133,6 +140,124 @@ class PlaybackReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(cache.lookup(song.video_id))
             self.assertEqual(first.read_bytes(), source.read_bytes())
             service.get_metadata.assert_not_awaited()
+
+    async def test_explicit_ffprobe_corruption_invalidates_only_its_cache_and_downloads_once(self):
+        diagnostics = (
+            "record.wav: Invalid data found when processing input",
+            "invalid RIFF header",
+            "invalid start code XXXX in RIFF header",
+            "no 'fmt ' or 'XMA2' tag found",
+            "no 'data' tag found",
+        )
+        for diagnostic in diagnostics:
+            with self.subTest(diagnostic=diagnostic), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cache, source, song = self.seed(root)
+                other = track(video_id="bcdefghijkl")
+                self.assertIsNotNone(cache.store(other, source, {"duration_seconds": 1}))
+                job_a, job_b = root / "job-a", root / "job-b"
+                job_a.mkdir()
+                job_b.mkdir()
+                error = UserFacingError("cached audio is corrupt")
+                error.__cause__ = ProcessExitError(
+                    label="ffprobe", returncode=1, diagnostic=diagnostic
+                )
+                service = self.service(root, cache)
+                service._probe = AsyncMock(side_effect=[wav_probe(), error])
+                service.get_metadata = AsyncMock(return_value=song)
+                service._download_resolved = AsyncMock(
+                    return_value=(job_b / "record.wav", song, {"cache_hit": False})
+                )
+                private, _, _ = await service.download_and_convert(song, job_a)
+                with patch.object(cache, "invalidate", wraps=cache.invalidate) as invalidate:
+                    path, resolved, media = await service.download_and_convert(song, job_b)
+                invalidate.assert_called_once_with(song.video_id)
+                service.get_metadata.assert_awaited_once()
+                service._download_resolved.assert_awaited_once()
+                self.assertEqual(path, job_b / "record.wav")
+                self.assertEqual(resolved, song)
+                self.assertFalse(media["cache_hit"])
+                self.assertIsNone(cache.lookup(song.video_id))
+                self.assertIsNotNone(cache.lookup(other.video_id))
+                self.assertEqual(private.read_bytes(), source.read_bytes())
+
+    async def test_probe_environment_failures_preserve_cache_without_downloading(self):
+        failures = [
+            ProcessTimeout("probe timeout"),
+            ProcessError("cannot start ffprobe: Invalid data found when processing input"),
+            ProcessError("program missing"),
+            ProcessExitError(
+                label="ffprobe",
+                returncode=-9,
+                diagnostic="Invalid data found when processing input",
+            ),
+            ProcessExitError(
+                label="ffprobe",
+                returncode=137,
+                diagnostic="Invalid data found when processing input",
+            ),
+            ProcessExitError(
+                label="ffprobe",
+                returncode=1,
+                diagnostic="Permission denied; Invalid data found when processing input",
+            ),
+            ProcessExitError(
+                label="ffprobe",
+                returncode=1,
+                diagnostic="Input/output error; Invalid data found when processing input",
+            ),
+            ProcessExitError(
+                label="ffprobe",
+                returncode=1,
+                diagnostic="Failed to load library; Invalid data found when processing input",
+            ),
+            ProcessExitError(label="ffprobe", returncode=1, diagnostic="unknown probe failure"),
+            json.JSONDecodeError("invalid probe response", "broken", 0),
+            None,
+        ]
+        for failure in failures:
+            with self.subTest(failure=str(failure)), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cache, source, song = self.seed(root)
+                job = root / "job"
+                job.mkdir()
+                error = UserFacingError("probe unavailable")
+                error.__cause__ = failure
+                service = self.service(root, cache)
+                service._probe = AsyncMock(side_effect=error)
+                service.get_metadata = AsyncMock()
+                service._download_resolved = AsyncMock()
+                with (
+                    patch.object(cache, "invalidate", wraps=cache.invalidate) as invalidate,
+                    self.assertRaisesRegex(UserFacingError, "probe unavailable"),
+                ):
+                    await service.download_and_convert(song, job)
+                invalidate.assert_not_called()
+                service.get_metadata.assert_not_awaited()
+                service._download_resolved.assert_not_awaited()
+                self.assertEqual(cache.lookup(song.video_id).path.read_bytes(), source.read_bytes())
+
+    async def test_private_file_permission_failure_preserves_shared_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache, source, song = self.seed(root)
+            job = root / "job"
+            job.mkdir()
+            private_path = Mock(spec=Path)
+            private_path.stat.side_effect = PermissionError("private audio locked")
+            entry = AudioCacheEntry(private_path, song, {})
+            service = self.service(root, cache)
+            service._probe = AsyncMock(return_value=wav_probe())
+            service.get_metadata = AsyncMock()
+            with (
+                patch.object(cache, "copy_for_job", return_value=entry),
+                patch.object(cache, "invalidate", wraps=cache.invalidate) as invalidate,
+                self.assertRaises(UserFacingError),
+            ):
+                await service.download_and_convert(song, job)
+            invalidate.assert_not_called()
+            service.get_metadata.assert_not_awaited()
+            self.assertEqual(cache.lookup(song.video_id).path.read_bytes(), source.read_bytes())
 
     async def test_fresh_download_stores_cache_but_returns_private_job_wav(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -391,6 +516,197 @@ class SubmittedQueueReliabilityTests(unittest.IsolatedAsyncioTestCase):
             )
             for call in self.context.send_message.await_args_list
         )
+
+    async def test_repeated_cancellation_during_cleanup_releases_group_worker(self):
+        await self.add()
+        download_entered = asyncio.Event()
+        cleanup_started, cleanup_release, cleanup_finished = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        original_cleanup = self.plugin._cleanup_job
+
+        async def download(*_args, **_kwargs):
+            download_entered.set()
+            await asyncio.Future()
+
+        def delayed_cleanup(job):
+            cleanup_started.set()
+            cleanup_release.wait(3)
+            original_cleanup(job)
+            cleanup_finished.set()
+
+        self.plugin.service.download_and_convert = AsyncMock(side_effect=download)
+        with patch.object(self.plugin, "_cleanup_job", side_effect=delayed_cleanup):
+            self.plugin._start_worker(self.key)
+            await asyncio.wait_for(download_entered.wait(), 2)
+            await run_blocking(
+                self.plugin.state.update, lambda data: data["paused"].append(self.key)
+            )
+            worker = self.plugin._workers[self.key]
+            worker.cancel()
+            try:
+                self.assertTrue(await asyncio.to_thread(cleanup_started.wait, 2))
+                worker.cancel()
+                await asyncio.sleep(0.02)
+                self.assertFalse(worker.done())
+            finally:
+                cleanup_release.set()
+                await asyncio.gather(worker, return_exceptions=True)
+        self.assertTrue(cleanup_finished.is_set())
+        self.assertTrue(worker.cancelled())
+        self.assertNotIn(self.key, self.plugin._workers)
+        self.assertNotIn(self.key, self.plugin._current)
+        self.assertFalse(self.plugin.audio_cache.protected_video_ids)
+        self.assertEqual(self.voice_submission_count(), 0)
+        await self.plugin.queue_action(self.key, "resume", admin=True)
+        resumed = self.plugin._workers[self.key]
+        self.assertIsNot(resumed, worker)
+        await self.wait_for(lambda: self.plugin.service.download_and_convert.await_count == 2)
+        self.assertFalse(resumed.done())
+        await self.plugin.queue_action(self.key, "pause", admin=True)
+
+    async def test_actual_onebot_timeout_does_not_send_a_link_fallback(self):
+        from aiocqhttp.api_impl import ResultStore
+        from aiocqhttp.exceptions import NetworkError
+
+        sequence = 900000001
+        with self.assertRaises(NetworkError) as caught:
+            await ResultStore.fetch(sequence, 0.001)
+        self.assertNotIsInstance(caught.exception, TimeoutError)
+        self.assertNotIn(sequence, ResultStore._futures)
+        self.context.send_message.side_effect = caught.exception
+        with self.assertRaises(self.runtime.module.UserFacingError):
+            await self.plugin._send_song(
+                {"umo": self.event.unified_msg_origin}, self.song, self.root / "record.wav"
+            )
+        self.assertEqual(self.context.send_message.await_count, 1)
+        self.assertEqual(self.voice_submission_count(), 1)
+
+    async def test_onebot_connection_failure_does_not_send_a_link_fallback(self):
+        from aiocqhttp.exceptions import NetworkError
+
+        for error in (NetworkError("HTTP request failed"), ConnectionResetError("OneBot reset")):
+            with self.subTest(error=type(error).__name__):
+                self.context.send_message.reset_mock()
+                self.context.send_message.side_effect = error
+                with self.assertRaises(self.runtime.module.UserFacingError):
+                    await self.plugin._send_song(
+                        {"umo": self.event.unified_msg_origin}, self.song, self.root / "record.wav"
+                    )
+                self.assertEqual(self.context.send_message.await_count, 1)
+                self.assertEqual(self.voice_submission_count(), 1)
+
+    async def test_unknown_onebot_receipt_pauses_without_history_or_fallback(self):
+        from aiocqhttp.exceptions import NetworkError
+
+        await self.add()
+        row = self.plugin.state.snapshot("queues", self.key)[0]
+        self.plugin.service.download_and_convert = AsyncMock(
+            return_value=(self.root / "record.wav", self.song, {})
+        )
+        self.context.send_message.side_effect = NetworkError("WebSocket API call timeout")
+        self.plugin._start_worker(self.key)
+        await self.wait_for(
+            lambda: self.key in self.plugin._errors and self.key not in self.plugin._workers
+        )
+        self.assertEqual(self.context.send_message.await_count, 1)
+        self.assertEqual(self.voice_submission_count(), 1)
+        self.assertEqual(self.plugin.state.snapshot("queues", self.key), [row])
+        self.assertIn(self.key, self.plugin.state.snapshot("paused"))
+        self.assertFalse(self.plugin.library.history(self.owner))
+
+    async def unknown_link_receipts_pause(self, strategy):
+        from aiocqhttp.exceptions import NetworkError
+
+        self.plugin.settings = replace(self.plugin.settings, send_strategy=strategy)
+        self.plugin.service.settings = self.plugin.settings
+        await self.add()
+        row = self.plugin.state.snapshot("queues", self.key)[0]
+        self.plugin.service.download_and_convert = AsyncMock(
+            return_value=(self.root / "record.wav", self.song, {})
+        )
+        fallback = strategy == "voice_then_link"
+        for error in (
+            NetworkError("WebSocket API call timeout"),
+            ConnectionResetError("OneBot connection reset"),
+            TimeoutError("OneBot receipt deadline"),
+        ):
+            with self.subTest(strategy=strategy, error=type(error).__name__):
+                self.context.send_message.reset_mock()
+                self.plugin.service.download_and_convert.reset_mock()
+                # False is a definite non-submission, unlike a lost API receipt.
+                self.context.send_message.side_effect = [False, error] if fallback else error
+                await self.plugin.queue_action(self.key, "resume", admin=True)
+                await self.wait_for(
+                    lambda: self.key in self.plugin._errors and self.key not in self.plugin._workers
+                )
+                message = self.plugin._errors[self.key]
+                self.assertIn("\u94fe\u63a5\u63d0\u4ea4", message)
+                self.assertIn("\u7ed3\u679c\u672a\u77e5", message)
+                self.assertIn("\u6838\u5bf9\u6d88\u606f", message)
+                self.assertEqual(self.context.send_message.await_count, 2 if fallback else 1)
+                self.assertEqual(self.voice_submission_count(), 1 if fallback else 0)
+                self.assertEqual(self.plugin.state.snapshot("queues", self.key), [row])
+                self.assertEqual(self.plugin._error_entry_ids[self.key], row["id"])
+                self.assertIn(self.key, self.plugin.state.snapshot("paused"))
+                self.assertFalse(self.plugin.library.history(self.owner))
+                self.assertNotIn(self.key, self.plugin._current)
+                self.assertFalse(self.plugin.audio_cache.protected_video_ids)
+                calls = self.context.send_message.await_args_list
+                self.assertTrue(
+                    all(call.args[0] == self.event.unified_msg_origin for call in calls)
+                )
+                self.assertTrue(
+                    any(
+                        isinstance(component, self.runtime.module.Comp.Plain)
+                        and self.song.url in component.text
+                        for component in calls[-1].args[1].chain
+                    )
+                )
+                if fallback:
+                    self.plugin.service.download_and_convert.assert_awaited_once()
+                else:
+                    self.plugin.service.download_and_convert.assert_not_awaited()
+
+    async def test_link_only_unknown_receipts_pause_without_retry_or_audio_history(self):
+        await self.unknown_link_receipts_pause("link_only")
+
+    async def test_fallback_link_unknown_receipts_pause_after_only_two_attempts(self):
+        await self.unknown_link_receipts_pause("voice_then_link")
+
+    async def successful_link_submission(self, strategy):
+        self.plugin.settings = replace(self.plugin.settings, send_strategy=strategy)
+        self.plugin.service.settings = self.plugin.settings
+        await self.add()
+        self.plugin.service.download_and_convert = AsyncMock(
+            return_value=(self.root / "record.wav", self.song, {})
+        )
+        fallback = strategy == "voice_then_link"
+        self.context.send_message.side_effect = [False, True] if fallback else [True]
+        self.plugin._start_worker(self.key)
+        await self.wait_for(lambda: not self.plugin.state.snapshot("queues", self.key))
+        self.assertTrue(self.plugin._current[self.key]["submitted"])
+        self.assertNotIn(self.key, self.plugin._errors)
+        self.assertNotIn(self.key, self.plugin.state.snapshot("paused"))
+        self.assertFalse(self.plugin.library.history(self.owner))
+        self.assertEqual(self.context.send_message.await_count, 2 if fallback else 1)
+        self.assertEqual(self.voice_submission_count(), 1 if fallback else 0)
+        if fallback:
+            self.plugin.service.download_and_convert.assert_awaited_once()
+        else:
+            self.plugin.service.download_and_convert.assert_not_awaited()
+        await self.plugin.queue_action(self.key, "pause", admin=True)
+        self.assertEqual(self.context.send_message.await_count, 2 if fallback else 1)
+        self.assertNotIn(self.key, self.plugin._workers)
+        self.assertFalse(self.plugin.audio_cache.protected_video_ids)
+
+    async def test_successful_link_only_removes_head_without_audio_history(self):
+        await self.successful_link_submission("link_only")
+
+    async def test_definite_voice_rejection_can_still_submit_one_link_fallback(self):
+        await self.successful_link_submission("voice_then_link")
 
     async def test_pause_during_finalization_keeps_history_for_already_submitted_voice(self):
         await self.add()

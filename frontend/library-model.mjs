@@ -1,6 +1,13 @@
 export const LIBRARY_PAGE_SIZE = 20;
 export const MAX_BATCH_SELECTION = 20;
 
+export function queuedVideoIds(queue) {
+  const ids = new Set((queue?.items || []).map((item) => item.song.video_id));
+  const current = queue?.current?.row?.song?.video_id;
+  if (typeof current === "string" && current) ids.add(current);
+  return ids;
+}
+
 export function libraryEntries(library, source) {
   return source === "history"
     ? (library.history || []).map((row) => ({ ...row }))

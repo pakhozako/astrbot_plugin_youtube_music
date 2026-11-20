@@ -10,6 +10,8 @@ from unittest.mock import patch
 from core.errors import friendly_process_error
 from core.process import (
     ProcessCaptureLimit,
+    ProcessError,
+    ProcessExitError,
     ProcessOutputLimit,
     ProcessTimeout,
     _kill_process_tree,
@@ -46,6 +48,39 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.stdout, "metadata")
         self.assertEqual(result.stderr, "warning")
+
+    async def test_nonzero_exit_has_structured_bounded_diagnostics_in_both_modes(self):
+        script = (
+            "import sys; "
+            "sys.stderr.write('opening\\n' + 'x' * 4000 + '\\nInvalid media payload\\n'); "
+            "sys.exit(7)"
+        )
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                with self.assertRaises(ProcessExitError) as caught:
+                    await run_process(
+                        [sys.executable, "-u", "-c", script],
+                        timeout=5,
+                        label="media probe",
+                        on_output_line=(lambda *_args: None) if streaming else None,
+                    )
+                error = caught.exception
+                self.assertIsInstance(error, ProcessError)
+                self.assertEqual(error.returncode, 7)
+                self.assertLessEqual(len(error.diagnostic), 1800)
+                self.assertLessEqual(len(error.diagnostic.splitlines()), 8)
+                self.assertTrue(error.diagnostic.endswith("Invalid media payload"))
+                self.assertNotIn("opening", error.diagnostic)
+                self.assertIn(error.diagnostic, str(error))
+
+    async def test_startup_failures_are_not_misclassified_as_process_exits(self):
+        for failure in (FileNotFoundError("not installed"), PermissionError("denied")):
+            with self.subTest(failure=type(failure).__name__):
+                with patch("core.process.asyncio.create_subprocess_exec", side_effect=failure):
+                    with self.assertRaises(ProcessError) as caught:
+                        await run_process(["unused-program"], timeout=1)
+                self.assertNotIsInstance(caught.exception, ProcessExitError)
+                self.assertIs(caught.exception.__cause__, failure)
 
     async def test_repeated_cancellation_cannot_abandon_process_tree_termination(self):
         entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()

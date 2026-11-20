@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from core.maintenance import MaintenanceGate, MaintenanceUnavailable, run_blocking
-from core.queue import JobLimiter
+from core.queue import JobLimiter, QueueWaitTimeout
 from core.service import YouTubeMusicService
 from core.settings import Settings
 from core.utils import Song
@@ -21,6 +21,172 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         service = YouTubeMusicService(settings)
         service.dependency_gate = MaintenanceGate()
         return service
+
+    async def cancel_while_exit_lock_is_held(self, condition, task):
+        await condition.acquire()
+        try:
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+            self.assertFalse(task.done(), "Cancellation must wait for locked cleanup")
+        finally:
+            condition.release()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+
+    async def test_repeated_slot_cancellation_releases_capacity_and_preserves_fifo(self):
+        limiter = JobLimiter(max_concurrent=1, max_queued=2)
+        entered = asyncio.Event()
+        order = []
+
+        async def hold():
+            async with limiter.slot(wait_timeout=2):
+                entered.set()
+                await asyncio.Future()
+
+        async def wait(label):
+            async with limiter.slot(wait_timeout=2):
+                order.append(label)
+                self.assertEqual(limiter.active, 1)
+                await asyncio.sleep(0)
+
+        holder = asyncio.create_task(hold())
+        await entered.wait()
+        first = asyncio.create_task(wait("first"))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(wait("second"))
+        await asyncio.sleep(0)
+        try:
+            await self.cancel_while_exit_lock_is_held(limiter._condition, holder)
+            await asyncio.gather(first, second)
+        finally:
+            for task in (first, second):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+        self.assertEqual(order, ["first", "second"])
+        self.assertEqual(limiter.active, 0)
+        self.assertFalse(limiter._waiters)
+        async with limiter.slot(wait_timeout=0.1):
+            self.assertEqual(limiter.active, 1)
+        self.assertEqual(limiter.active, 0)
+
+    async def test_repeated_use_cancellation_releases_original_holder_and_restores_work(self):
+        gate = MaintenanceGate()
+        entered = asyncio.Event()
+
+        async def hold():
+            async with gate.use():
+                entered.set()
+                await asyncio.Future()
+
+        holder = asyncio.create_task(hold())
+        await entered.wait()
+        self.assertEqual(gate._holders, {holder: 1})
+        await self.cancel_while_exit_lock_is_held(gate._condition, holder)
+        self.assertFalse(gate._holders)
+        self.assertFalse(gate.task_snapshot())
+        async with gate.maintenance(timeout=0.1):
+            self.assertTrue(gate.maintaining)
+        async with gate.use(timeout=0.1):
+            self.assertEqual(gate._holders, {asyncio.current_task(): 1})
+        self.assertFalse(gate.task_snapshot())
+
+    async def test_repeated_nested_use_cancellation_releases_every_original_holder_depth(self):
+        gate = MaintenanceGate()
+        owner = asyncio.current_task()
+        async with gate.use():
+            self.assertEqual(gate._holders, {owner: 1})
+            async with gate.use():
+                self.assertEqual(gate._holders, {owner: 2})
+            self.assertEqual(gate._holders, {owner: 1})
+        self.assertFalse(gate._holders)
+        entered = asyncio.Event()
+
+        async def hold():
+            async with gate.use():
+                async with gate.use():
+                    entered.set()
+                    await asyncio.Future()
+
+        holder = asyncio.create_task(hold())
+        await entered.wait()
+        self.assertEqual(gate._holders, {holder: 2})
+        await self.cancel_while_exit_lock_is_held(gate._condition, holder)
+        self.assertFalse(gate.task_snapshot())
+        async with gate.maintenance(timeout=0.1):
+            self.assertTrue(gate.maintaining)
+        self.assertFalse(gate.maintaining)
+
+    async def test_repeated_maintenance_cancellation_releases_exclusive_update_and_restores_work(
+        self,
+    ):
+        gate = MaintenanceGate()
+        entered = asyncio.Event()
+
+        async def update():
+            async with gate.maintenance():
+                entered.set()
+                await asyncio.Future()
+
+        updater = asyncio.create_task(update())
+        await entered.wait()
+        self.assertTrue(gate.maintaining)
+        self.assertEqual(gate.update_tasks, {updater})
+        await self.cancel_while_exit_lock_is_held(gate._condition, updater)
+        self.assertFalse(gate.maintaining)
+        self.assertFalse(gate.task_snapshot())
+        async with gate.use(timeout=0.1):
+            self.assertEqual(gate._holders, {asyncio.current_task(): 1})
+        async with gate.maintenance(timeout=0.1):
+            self.assertEqual(gate.update_tasks, {asyncio.current_task()})
+        self.assertFalse(gate.task_snapshot())
+
+    async def test_resource_finalizers_preserve_body_errors(self):
+        gate = MaintenanceGate()
+        limiter = JobLimiter(max_concurrent=1, max_queued=1)
+        with self.assertRaisesRegex(RuntimeError, "slot failed"):
+            async with limiter.slot(wait_timeout=0.1):
+                raise RuntimeError("slot failed")
+        self.assertEqual(limiter.active, 0)
+        with self.assertRaisesRegex(RuntimeError, "use failed"):
+            async with gate.use():
+                raise RuntimeError("use failed")
+        self.assertFalse(gate.task_snapshot())
+        with self.assertRaisesRegex(RuntimeError, "update failed"):
+            async with gate.maintenance():
+                raise RuntimeError("update failed")
+        self.assertFalse(gate.maintaining)
+        self.assertFalse(gate.task_snapshot())
+
+    async def test_admission_timeouts_keep_existing_errors_and_restore_resources(self):
+        gate = MaintenanceGate()
+        limiter = JobLimiter(max_concurrent=1, max_queued=1)
+        async with limiter.slot(wait_timeout=0.1):
+            with self.assertRaises(QueueWaitTimeout):
+                async with limiter.slot(wait_timeout=0.01):
+                    self.fail("A timed-out waiter cannot enter")
+            self.assertEqual(limiter.active, 1)
+            self.assertFalse(limiter._waiters)
+        self.assertEqual(limiter.active, 0)
+        async with gate.maintenance():
+            with self.assertRaises(MaintenanceUnavailable):
+                async with gate.use(timeout=0.01):
+                    self.fail("A timed-out dependency user cannot enter")
+            self.assertTrue(gate.maintaining)
+            self.assertFalse(gate._holders)
+        async with gate.use():
+
+            async def update():
+                async with gate.maintenance(timeout=0.01):
+                    self.fail("A timed-out maintenance task cannot enter")
+
+            with self.assertRaises(TimeoutError):
+                await asyncio.create_task(update())
+            self.assertFalse(gate.maintaining)
+            self.assertFalse(gate.update_tasks)
+            self.assertEqual(gate._holders, {asyncio.current_task(): 1})
+        self.assertFalse(gate.task_snapshot())
 
     async def test_cancel_waits_for_file_thread(self):
         started, release, finished = threading.Event(), threading.Event(), threading.Event()

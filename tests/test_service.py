@@ -39,6 +39,47 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([song.video_id for song in songs], ["abcdefghijk"])
         self.assertEqual(songs[0].url, "https://www.youtube.com/watch?v=abcdefghijk")
 
+    async def test_search_id_dedup_keeps_the_most_relevant_valid_metadata(self):
+        payload = {
+            "entries": [
+                {
+                    "id": "abcdefghijk",
+                    "title": "Unrelated",
+                    "channel": "Uploader",
+                    "duration": 60,
+                },
+                {
+                    "id": "abcdefghijk",
+                    "title": "Hello",
+                    "artist": "Adele",
+                    "duration": 61,
+                    "thumbnail": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+                },
+                {
+                    "id": "bcdefghijkl",
+                    "title": "Hello (Cover)",
+                    "artist": "Other Artist",
+                    "duration": 60,
+                },
+            ]
+        }
+        for candidate_pool in (False, True):
+            with self.subTest(candidate_pool=candidate_pool):
+                service = self.service()
+                service._run_ytdlp = AsyncMock(
+                    return_value=ProcessResult((), 0, json.dumps(payload), "")
+                )
+                songs = await service.search("Adele Hello", candidate_pool=candidate_pool)
+                self.assertEqual(
+                    [(row.video_id, row.title) for row in songs],
+                    [("abcdefghijk", "Hello"), ("bcdefghijkl", "Hello (Cover)")],
+                )
+                self.assertEqual(songs[0].artist, "Adele")
+                self.assertEqual(songs[0].duration, 61)
+                self.assertEqual(
+                    songs[0].thumbnail_url, "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg"
+                )
+
     async def test_invalid_metadata_url_never_executes_a_process(self):
         service = self.service()
         service._run_ytdlp = AsyncMock()

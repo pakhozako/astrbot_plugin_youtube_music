@@ -35,6 +35,23 @@ async def run_blocking(function, /, *args, **kwargs):
     return result
 
 
+async def _finish_cleanup(awaitable):
+    """Finish async resource cleanup before propagating repeated cancellation."""
+    cleanup = asyncio.create_task(awaitable)
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(cleanup)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            if cleanup.done():
+                cleanup.result()
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 class MaintenanceGate:
     def __init__(self):
         self._condition = asyncio.Condition()
@@ -63,13 +80,17 @@ class MaintenanceGate:
         try:
             yield
         finally:
-            async with self._condition:
-                count = self._holders.get(task, 1) - 1
-                if count:
-                    self._holders[task] = count
-                else:
-                    self._holders.pop(task, None)
-                self._condition.notify_all()
+
+            async def release_holder():
+                async with self._condition:
+                    count = self._holders.get(task, 1) - 1
+                    if count:
+                        self._holders[task] = count
+                    else:
+                        self._holders.pop(task, None)
+                    self._condition.notify_all()
+
+            await _finish_cleanup(release_holder())
 
     @asynccontextmanager
     async def maintenance(self, *, timeout: float = 120):
@@ -94,10 +115,14 @@ class MaintenanceGate:
         try:
             yield
         finally:
-            async with self._condition:
-                self.maintaining = False
-                self.update_tasks.discard(task)
-                self._condition.notify_all()
+
+            async def release_maintenance():
+                async with self._condition:
+                    self.maintaining = False
+                    self.update_tasks.discard(task)
+                    self._condition.notify_all()
+
+            await _finish_cleanup(release_maintenance())
 
     async def close(self) -> None:
         async with self._condition:

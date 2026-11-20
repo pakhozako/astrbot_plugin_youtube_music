@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 from .errors import UserFacingError
+from .maintenance import _finish_cleanup
 
 MAX_BATCH_SIZE = 20
 
@@ -81,6 +82,10 @@ class JobLimiter:
         try:
             yield
         finally:
-            async with self._condition:
-                self._active -= 1
-                self._condition.notify_all()
+
+            async def release_slot():
+                async with self._condition:
+                    self._active -= 1
+                    self._condition.notify_all()
+
+            await _finish_cleanup(release_slot())

@@ -697,6 +697,83 @@ test("library batch confirms all selected IDs in sorted order and skips queued t
   expect(await page.evaluate(() => window.mockControl.fixtures.queues["session-a"].items.map((item) => item.song.video_id))).toEqual(["abcdefghijk", "bcdefghijkl", "cdefghijklm"]);
 });
 
+test("current-track markers and duplicate controls update without a pending-queue change", async ({ page }) => {
+  await search(page);
+  const first = page.locator("#results .track-row").first();
+  await expect(first.locator(".track-queued-label")).toHaveText("已在队列");
+  await expect(first.getByRole("button", { name: "加入队列", exact: true })).toBeDisabled();
+  for (const dark of [false, true]) {
+    await page.evaluate((value) => window.mockControl.theme(value), dark);
+    const colors = await page.locator("#results .track-actions button:first-child").evaluateAll((buttons) => buttons.map((button) => ({
+      disabled: button.disabled, color: getComputedStyle(button).color,
+    })));
+    expect(colors.find((button) => button.disabled).color).not.toBe(colors.find((button) => !button.disabled).color);
+  }
+  await page.evaluate(() => window.mockControl.theme(false));
+  await page.evaluate(() => {
+    const control = window.mockControl;
+    const queue = control.fixtures.queues["session-a"];
+    queue.current = { row: queue.items[0], submitted: false, phase: "等待处理" };
+    control.notify();
+  });
+  await expect(first.locator(".track-queued-label")).toHaveText("当前曲目");
+  await page.evaluate(() => {
+    const control = window.mockControl;
+    const queue = control.fixtures.queues["session-a"];
+    queue.current.submitted = true;
+    queue.current.phase = "已提交语音";
+    queue.items = [];
+    control.library.favorites = control.songs.slice();
+    control.notify();
+  });
+  await expect(first.locator(".track-queued-label")).toHaveText("当前曲目");
+  await page.locator('.tabs [data-view="library"]').click();
+  const favorite = page.locator("#library-list .track-row").first();
+  await expect(favorite.locator(".track-queued-label")).toHaveText("当前曲目");
+  await expect(favorite.getByRole("button", { name: "加入队列", exact: true })).toBeDisabled();
+  await page.evaluate(() => window.mockControl.locale("en-US"));
+  await expect(favorite.locator(".track-queued-label")).toHaveText("Current track");
+  await page.locator("#session").selectOption("session-b");
+  await expect(favorite.locator(".track-queued-label")).toHaveCount(0);
+  await expect(favorite.getByRole("button", { name: "Add to queue", exact: true })).toBeEnabled();
+  await page.locator("#session").selectOption("session-a");
+  await expect(favorite.locator(".track-queued-label")).toHaveText("Current track");
+  await page.evaluate(() => {
+    window.mockControl.fixtures.queues["session-a"].current = null;
+    window.mockControl.notify();
+  });
+  await expect(favorite.locator(".track-queued-label")).toHaveCount(0);
+  await expect(favorite.getByRole("button", { name: "Add to queue", exact: true })).toBeEnabled();
+  await page.locator('.tabs [data-view="search"]').click();
+  await expect(first.locator(".track-queued-label")).toHaveCount(0);
+  await expect(first.getByRole("button", { name: "Add to queue", exact: true })).toBeEnabled();
+  expect(await page.evaluate(() => window.mockControl.requests.filter((request) => request.endpoint === "queue/add").length)).toBe(0);
+});
+
+test("batch confirmation skips the submitted current song without charging pending capacity twice", async ({ page }, info) => {
+  await page.evaluate(() => {
+    const control = window.mockControl;
+    const queue = control.fixtures.queues["session-a"];
+    queue.current = { row: queue.items[0], submitted: true, phase: "已提交语音" };
+    queue.items = queue.items.slice(1);
+    control.library.favorites = control.songs.slice();
+    control.notify();
+  });
+  await page.locator('.tabs [data-view="library"]').click();
+  await expect(page.locator("#library-list .track-row")).toHaveCount(3);
+  await page.locator("#library-select-page").check();
+  await page.locator("#library-batch").click();
+  await expect(page.locator("#confirm-detail")).toContainText("将加入 1 首 · 跳过已排队 2 首");
+  await expect(page.locator("#confirm-detail")).toContainText("预计队列 2 / 20");
+  await expect(page.locator("#confirm-tracks li").first()).toContainText("已在队列");
+  await page.screenshot({ path: `${screenshots}/${info.project.name}-current-track-batch-confirm.png`, animations: "disabled" });
+  await page.getByRole("dialog").getByRole("button", { name: "确认", exact: true }).click();
+  await expect(page.locator("#toast")).toContainText("已加入队列 1 首 · 跳过已排队 2 首");
+  expect(await page.evaluate(() => window.mockControl.fixtures.queues["session-a"].items.map((item) => item.song.video_id))).toEqual(["bcdefghijkl", "cdefghijklm"]);
+  expect(await page.evaluate(() => window.mockControl.fixtures.queues["session-a"].current.row.song.video_id)).toBe("abcdefghijk");
+  await expect(page.locator("#library-selection-summary")).toContainText("已选 0 / 20");
+});
+
 test("library batch retains its captured session and source without clearing newer selections", async ({ page }) => {
   await page.evaluate(() => {
     const control = window.mockControl;

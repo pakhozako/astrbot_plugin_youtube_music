@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   LIBRARY_PAGE_SIZE, MAX_BATCH_SELECTION, libraryEntries, libraryPage,
-  orderedLibraryEntries, pruneSelection, selectedLibraryEntries, selectTracks, summarizeSongs,
+  orderedLibraryEntries, pruneSelection, queuedVideoIds, selectedLibraryEntries, selectTracks, summarizeSongs,
 } from "../frontend/library-model.mjs";
 
 const songs = [
@@ -15,6 +15,28 @@ const library = {
   history: songs.map((song, index) => ({ song, played_at: index + 1, play_count: [3, 5, 5][index] })),
 };
 const ids = (entries) => entries.map(({ song }) => song.video_id);
+
+test("queued identities include the current song throughout processing and playback wait", () => {
+  for (const submitted of [false, true]) {
+    const queue = { items: [{ song: songs[1] }], current: { row: { song: songs[0] }, submitted } };
+    const before = structuredClone(queue);
+    assert.deepEqual([...queuedVideoIds(queue)], [songs[1].video_id, songs[0].video_id]);
+    assert.deepEqual(queue, before);
+  }
+  const queue = { items: [{ song: songs[0] }], current: { row: { song: songs[0] } } };
+  assert.equal(queuedVideoIds(queue).size, 1);
+});
+
+test("queued identities remain session-local and are released when only the current item changes", () => {
+  const first = { items: [], current: { row: { song: songs[0] }, submitted: true } };
+  const other = { items: [], current: null };
+  assert.deepEqual([...queuedVideoIds(first)], [songs[0].video_id]);
+  assert.equal(queuedVideoIds(other).size, 0);
+  first.current = null;
+  assert.equal(queuedVideoIds(first).size, 0);
+  assert.equal(queuedVideoIds(undefined).size, 0);
+  assert.equal(queuedVideoIds({ current: { row: { song: {} } } }).size, 0);
+});
 
 test("library entries retain history metadata without mutating source records", () => {
   const entries = libraryEntries(library, "history");

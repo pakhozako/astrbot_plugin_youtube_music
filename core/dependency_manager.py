@@ -41,7 +41,7 @@ class DependencyUpdateError(RuntimeError):
 
 
 class DependencyManager:
-    USER_AGENT = "AstrBot-YouTube-Music-Dependency-Manager/0.2.0"
+    USER_AGENT = "AstrBot-YouTube-Music-Dependency-Manager/0.3.0"
     MAX_CHECKSUM_BYTES = 1024 * 1024
     MAX_YTDLP_BYTES = 100 * 1024 * 1024
     MAX_DENO_ZIP_BYTES = 150 * 1024 * 1024

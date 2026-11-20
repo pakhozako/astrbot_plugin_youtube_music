@@ -122,6 +122,7 @@ window.AstrBotPluginView = {
       const queue = targetQueue(body.session);
       const song = resolveSong(body);
       validateDuration(song);
+      if (queue.current?.row?.song.video_id === song.video_id) throw new Error("这首歌正在播放或处理，请等待后再点播。");
       if (queue.items.some((item) => item.song.video_id === song.video_id)) throw new Error("这首歌已在队列中。");
       if (queue.items.length >= fixtures.limits.queue) throw new Error("当前会话队列已满。");
       queue.items.push({ id: `mock-${++nextId}`, song: clone(song), requested_by: "Dashboard" });
@@ -138,6 +139,7 @@ window.AstrBotPluginView = {
         return song;
       });
       const existing = new Set(queue.items.map((item) => item.song.video_id));
+      if (queue.current?.row?.song.video_id) existing.add(queue.current.row.song.video_id);
       const additions = requested.filter((song) => !existing.has(song.video_id));
       const skipped = requested.filter((song) => existing.has(song.video_id)).map((song) => song.video_id);
       additions.forEach(validateDuration);

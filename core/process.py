@@ -27,6 +27,15 @@ class ProcessError(RuntimeError):
     pass
 
 
+class ProcessExitError(ProcessError):
+    """A started process exited unsuccessfully with bounded, structured diagnostics."""
+
+    def __init__(self, *, label: str, returncode: int, diagnostic: str):
+        self.returncode = returncode
+        self.diagnostic = "\n".join(str(diagnostic).splitlines()[-8:])[-1800:]
+        super().__init__(f"{label}退出码为 {returncode}。{self.diagnostic}")
+
+
 class ProcessTimeout(ProcessError):
     pass
 
@@ -262,7 +271,7 @@ async def run_process(
         if result.returncode != 0:
             detail = result.stderr or result.stdout or "程序没有提供错误详情。"
             detail = "\n".join(detail.splitlines()[-5:])[-1200:]
-            raise ProcessError(f"{label}退出码为 {result.returncode}。{detail}")
+            raise ProcessExitError(label=label, returncode=result.returncode, diagnostic=detail)
         return result
 
     stdout_lines: deque[str] = deque(maxlen=400)
@@ -377,5 +386,5 @@ async def run_process(
     if result.returncode != 0:
         detail = result.stderr or result.stdout or "程序没有提供错误详情。"
         detail = "\n".join(detail.splitlines()[-8:])[-1800:]
-        raise ProcessError(f"{label}退出码为 {result.returncode}。{detail}")
+        raise ProcessExitError(label=label, returncode=result.returncode, diagnostic=detail)
     return result

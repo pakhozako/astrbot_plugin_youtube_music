@@ -125,6 +125,51 @@ class SearchQualityTests(unittest.TestCase):
             with self.subTest(query=query):
                 self.assertEqual(version_label(rank_search_results(query, rows)[0]), label)
 
+    def test_explicit_english_version_suffix_does_not_become_a_song_name_keyword(self):
+        album = song(1, "Hello (Album Version) [Official Audio]", "Adele")
+        for alias, title, label in (
+            ("live", "Hello (Live)", "Live"),
+            ("cover", "Hello (Cover)", "\u7ffb\u5531"),
+            ("remix", "Hello (Club Remix)", "Remix"),
+            ("remixed", "Hello (Remixed)", "Remix"),
+        ):
+            requested = song(2, title, "Adele")
+            for modifier in (
+                f"{alias} version",
+                f"({alias} version)",
+                f"{alias}-version",
+                f"{alias.upper()} VERSION",
+            ):
+                query = f"Adele Hello {modifier}"
+                with self.subTest(query=query):
+                    self.assertEqual(rank_search_results(query, [album, requested])[0], requested)
+                    self.assertEqual(version_label(requested), label)
+                    self.assertEqual(
+                        search_relevance(query, requested),
+                        search_relevance(f"Adele Hello {alias}", requested),
+                    )
+
+    def test_literal_version_and_live_forever_names_remain_search_keywords(self):
+        literal = song(1, "Version (Official Audio)", "Adele")
+        unrelated = song(2, "Hello (Official Audio)", "Adele")
+        self.assertEqual(rank_search_results("Adele Version", [unrelated, literal])[0], literal)
+        named_live = song(3, "Version (Live)", "Adele")
+        other_live = song(4, "Hello (Live)", "Adele")
+        for query in ("Adele Version live", "Adele Version live version"):
+            with self.subTest(query=query):
+                self.assertEqual(
+                    rank_search_results(query, [other_live, named_live])[0], named_live
+                )
+        forever = song(5, "Live Forever Version", "Adele - Topic")
+        other = song(6, "Forever (Live Version)", "Adele")
+        self.assertEqual(
+            rank_search_results("Adele Live Forever Version", [other, forever])[0], forever
+        )
+        self.assertEqual(
+            rank_search_results("Adele Live Forever Version official audio", [other, forever])[0],
+            forever,
+        )
+
     def test_chinese_official_mv_modifiers_do_not_become_artist_keywords(self):
         audio = song(1, "Hello \u5b98\u65b9\u97f3\u9891")
         video = song(2, "Hello (Official Music Video)")
@@ -244,6 +289,57 @@ class SearchQualityTests(unittest.TestCase):
         preferred = song(2, "Hello [Official Audio]")
         more = song(3, "Hello (Official Audio)", artist="Other Artist")
         self.assertEqual(rank_search_results("Hello", [lower, preferred, more]), [preferred, more])
+
+    def test_exact_topic_suffix_normalizes_the_same_recording_identity(self):
+        for suffix in (" - Topic", " - TOPIC", " \u2013 Topic", " \u2014 Topic"):
+            artist = "Adele" + suffix
+            with self.subTest(artist=artist):
+                prefixed = song(1, "Adele - Hello (Official Audio)", artist, 61)
+                preferred = song(2, "Hello [Official Audio]", artist, 60)
+                canonical = song(3, "Hello (Official Audio)", "Adele", 62)
+                self.assertEqual(
+                    rank_search_results("Hello", [prefixed, preferred, canonical]), [preferred]
+                )
+                self.assertEqual(prefixed.artist, artist)
+                self.assertEqual(preferred.artist, artist)
+
+    def test_recording_identity_does_not_strip_unknown_channel_suffixes(self):
+        for artist in (
+            "Adele - Channel",
+            "Adele - Archive",
+            "Adele - Topic Archive",
+            "Adele - Music",
+            "Adele-Topic",
+            "Topic",
+        ):
+            with self.subTest(artist=artist):
+                rows = [
+                    song(1, "Adele - Hello (Official Audio)", artist, 61),
+                    song(2, "Hello [Official Audio]", artist, 60),
+                ]
+                self.assertEqual(len(rank_search_results("Hello", rows)), 2)
+
+    def test_unknown_topic_artists_still_do_not_allow_recording_dedup(self):
+        for artist in ("Unknown - Topic", "Unknown Channel - Topic", "Various Artists - Topic"):
+            with self.subTest(artist=artist):
+                rows = [
+                    song(1, "Hello (Official Audio)", artist),
+                    song(2, "Hello [Official Audio]", artist),
+                ]
+                self.assertEqual(rank_search_results("Hello", rows), rows)
+
+    def test_topic_dedup_keeps_artist_version_named_mix_and_duration_boundaries(self):
+        rows = [
+            song(1, "Hello (Official Audio)", "Adele - Topic"),
+            song(2, "Hello (Official Music Video)", "Adele - Topic"),
+            song(3, "Hello (Live)", "Adele - Topic"),
+            song(4, "Hello (Cover)", "Adele - Topic"),
+            song(5, "Hello (Club Remix)", "Adele - Topic"),
+            song(6, "Hello (Radio Remix)", "Adele - Topic"),
+            song(7, "Hello (Official Audio)", "Other - Topic"),
+            song(8, "Hello (Official Audio)", "Adele - Topic", 64),
+        ]
+        self.assertEqual(set(rank_search_results("Hello", rows)), set(rows))
 
     def test_normalized_artist_and_title_keep_named_versions_distinct(self):
         first = song(1, "Hello (Club Remix)")

@@ -7,7 +7,7 @@ import { icons } from "./icons.js";
 import { LiveConnection } from "../views/console/live-connection.mjs";
 import {
   MAX_BATCH_SELECTION, libraryEntries, libraryPage, orderedLibraryEntries,
-  pruneSelection, selectedLibraryEntries, selectTracks, summarizeSongs,
+  pruneSelection, queuedVideoIds, selectedLibraryEntries, selectTracks, summarizeSongs,
 } from "./library-model.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -224,10 +224,14 @@ async function fetchStatus() {
   const previousLabel = previousSnapshot?.sessions.find((session) => session.key === previousSelected)?.label;
   const nextLabel = snapshot.sessions.find((session) => session.key === selected)?.label;
   if (!previousSnapshot || previousSelected !== selected || previousLabel !== nextLabel || JSON.stringify(previousSnapshot.queues[selected]) !== JSON.stringify(snapshot.queues[selected])) drawQueue();
-  const previousQueuedIds = previousSnapshot?.queues[selected]?.items.map((item) => item.song.video_id);
-  const nextQueuedIds = snapshot.queues[selected]?.items.map((item) => item.song.video_id);
-  if (previousSelected !== selected) drawResults();
-  if (previousSelected !== selected || JSON.stringify(previousQueuedIds) !== JSON.stringify(nextQueuedIds)) drawLibrary();
+  const previousQueuedIds = [...queuedVideoIds(previousSnapshot?.queues[selected])];
+  const nextQueuedIds = [...queuedVideoIds(snapshot.queues[selected])];
+  const previousCurrentId = previousSnapshot?.queues[selected]?.current?.row?.song?.video_id;
+  const nextCurrentId = snapshot.queues[selected]?.current?.row?.song?.video_id;
+  if (previousSelected !== selected || previousCurrentId !== nextCurrentId || JSON.stringify(previousQueuedIds) !== JSON.stringify(nextQueuedIds)) {
+    drawResults();
+    drawLibrary();
+  }
   drawUpdate();
   renderAvailability();
   if (wasUpdating && !["waiting", "running"].includes(result.dependency_update.status)) loadMaintenance().catch(showError);
@@ -276,13 +280,15 @@ async function enqueue(target, song, index, source) {
 
 function drawResults() {
   const target = selected;
+  const queuedIds = queuedVideoIds(snapshot?.queues[target]);
+  const currentId = snapshot?.queues[target]?.current?.row?.song?.video_id;
   $("result-count").textContent = results.length ? String(results.length) : "";
   const rows = results.map((song, index) => {
     const row = element("li", "track-row");
     const actions = element("div", "track-actions");
     const favorite = library.favorites.some((item) => item.video_id === song.video_id);
     actions.append(
-      iconButton("Plus", t("addToQueue", "加入队列"), () => enqueue(target, song, index + 1, "search"), !target, `queue:${target}`),
+      iconButton("Plus", t("addToQueue", "加入队列"), () => enqueue(target, song, index + 1, "search"), !target || queuedIds.has(song.video_id), `queue:${target}`),
       iconButton(favorite ? "Check" : "Heart", t("favorite", "收藏歌曲"), async () => {
         await bridge.apiPost("library/action", { action: "favorite", index: index + 1, video_id: song.video_id });
         await loadLibrary();
@@ -292,6 +298,8 @@ function drawResults() {
     row.dataset.id = song.video_id;
     actions.querySelectorAll("button").forEach((button, action) => { button.dataset.focusKey = `${song.video_id}:${action}`; });
     const info = details(song, true);
+    if (queuedIds.has(song.video_id)) info.append(element("div", "track-queued-label",
+      song.video_id === currentId ? t("currentTrack", "当前曲目") : t("alreadyQueued", "已在队列")));
     row.append(artwork(song), info, element("span", "track-duration", duration(song.duration)), actions);
     return row;
   });
@@ -396,7 +404,8 @@ function drawLibrary() {
   $("library-selection-summary").textContent = `${t(source, source === "favorites" ? "收藏" : "历史")} · ${t("selected", "已选")} ${selection.size} / ${selectionLimit()} · ${durationSummary(summarizeSongs(selectedEntries.map(({ song }) => song)))}`;
   $("library-page-label").textContent = `${visibleLibraryPage.page} / ${visibleLibraryPage.pages} · ${visibleLibraryPage.start}–${visibleLibraryPage.end} / ${visibleLibraryPage.total}`;
   $("library-pagination").hidden = visibleLibraryPage.pages <= 1;
-  const queuedIds = new Set(snapshot?.queues[target]?.items.map((item) => item.song.video_id) || []);
+  const queuedIds = queuedVideoIds(snapshot?.queues[target]);
+  const currentId = snapshot?.queues[target]?.current?.row?.song?.video_id;
   const rows = visibleLibraryPage.items.map((entry) => {
     const { song } = entry;
     const row = element("li", "track-row library-row");
@@ -414,7 +423,7 @@ function drawLibrary() {
     });
     selector.append(checkbox);
     const actions = element("div", "track-actions");
-    actions.append(iconButton("Plus", t("addToQueue", "加入队列"), () => enqueue(target, song, undefined, source), !target, `queue:${target}`));
+    actions.append(iconButton("Plus", t("addToQueue", "加入队列"), () => enqueue(target, song, undefined, source), !target || queuedIds.has(song.video_id), `queue:${target}`));
     if (libraryView === "favorites") actions.append(iconButton("Trash2", t("removeFavorite", "移除收藏"), async () => {
       await bridge.apiPost("library/action", { action: "remove", video_id: song.video_id });
       await loadLibrary();
@@ -438,7 +447,8 @@ function drawLibrary() {
       );
       info.append(metadata);
     }
-    if (queuedIds.has(song.video_id)) info.append(element("div", "track-queued-label", t("alreadyQueued", "已在队列")));
+    if (queuedIds.has(song.video_id)) info.append(element("div", "track-queued-label",
+      song.video_id === currentId ? t("currentTrack", "当前曲目") : t("alreadyQueued", "已在队列")));
     row.append(selector, artwork(song), info, element("span", "track-duration", duration(song.duration)), actions);
     return row;
   });
@@ -695,7 +705,7 @@ async function start() {
     const batch = {
       target, source, entries: selectedLibraryEntries(library, source, librarySelection[source], libraryOptions()),
       label: snapshot?.sessions.find((session) => session.key === target)?.label || target,
-      queuedIds: new Set(queue?.items.map((item) => item.song.video_id) || []),
+      queuedIds: queuedVideoIds(queue),
       queueSize: queue?.items.length || 0, queueLimit: snapshot?.limits.queue || 0, generation: pageGeneration,
     };
     run($("library-batch"), () => enqueueLibraryBatch(batch));

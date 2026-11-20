@@ -6,7 +6,7 @@ desc: >-
   面向 QQ 群聊的候选分页、版本识别、语音点播、共享 FIFO 队列、收藏与历史重播。
   提供音乐 AI Tool、响应式 WebUI、仅限机器人搜索结果的安全自动撤回，
   以及使用 AstrBot 官方身份鉴权的依赖维护。
-version: 0.2.0
+version: 0.3.0
 # Project license: MIT; see LICENSE for the full copyright and permission notice.
 author: pakhozako
 repo: https://github.com/pakhozako/astrbot_plugin_youtube_music

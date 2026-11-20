@@ -15,7 +15,7 @@ from .audio_cache import AudioCache, AudioCacheEntry
 from .errors import UserFacingError as UserFacingError
 from .errors import friendly_process_error, transient_network_error
 from .maintenance import run_blocking, uses_dependencies
-from .process import ProcessError, ProcessOutputLimit, ProcessTimeout, run_process
+from .process import ProcessError, ProcessExitError, ProcessOutputLimit, ProcessTimeout, run_process
 from .search_quality import is_unavailable_live, rank_search_results
 from .settings import Settings
 from .utils import Song, parse_youtube_url, song_from_flat_entry, song_from_full_info
@@ -216,16 +216,14 @@ class YouTubeMusicService:
         if not isinstance(payload, dict) or entries is not None and not isinstance(entries, list):
             raise UserFacingError("搜索结果结构无效，请检查 yt-dlp。")
         songs: list[Song] = []
-        seen_ids: set[str] = set()
         for entry in entries or []:
             if not isinstance(entry, dict) or is_unavailable_live(entry):
                 continue
             song = song_from_flat_entry(entry)
-            if not song or song.video_id in seen_ids:
+            if not song:
                 continue
             if song.duration is None or song.duration <= 0 or song.duration > duration_cap:
                 continue
-            seen_ids.add(song.video_id)
             songs.append(song)
         songs = rank_search_results(query, songs)
         return songs[: fetch_count if candidate_pool else result_count]
@@ -326,6 +324,41 @@ class YouTubeMusicService:
             if not entry.users:
                 self._cache_locks.pop(video_id)
 
+    @staticmethod
+    def _corrupt_media_exit(exc: BaseException | None) -> bool:
+        if not isinstance(exc, ProcessExitError) or exc.returncode != 1:
+            return False
+        diagnostic = exc.diagnostic.casefold()
+        if any(
+            marker in diagnostic
+            for marker in (
+                "permission denied",
+                "operation not permitted",
+                "access is denied",
+                "access denied",
+                "no such file or directory",
+                "cannot allocate memory",
+                "not enough memory",
+                "resource temporarily unavailable",
+                "input/output error",
+                "i/o error",
+                "error while loading shared libraries",
+                "failed to load",
+                "unable to load",
+            )
+        ):
+            return False
+        return any(
+            marker in diagnostic
+            for marker in (
+                "invalid data found when processing input",
+                "invalid riff header",
+                "invalid start code",
+                "no 'fmt ' or 'xma2' tag found",
+                "no 'data' tag found",
+            )
+        )
+
     async def _validated_cache_entry(
         self,
         video_id: str,
@@ -351,6 +384,12 @@ class YouTubeMusicService:
             on_stage("校验已缓存音频")
         try:
             probe = await self._probe(entry.path)
+        except UserFacingError as exc:
+            if not self._corrupt_media_exit(exc.__cause__):
+                raise
+            await run_blocking(self.audio_cache.invalidate, video_id)
+            return None
+        try:
             stream = self._validated_wav_stream(probe)
             duration = float(probe.get("duration") or 0)
             duration_cap = (
@@ -358,14 +397,20 @@ class YouTubeMusicService:
                 if max_duration_seconds is not None
                 else self.settings.max_duration_seconds
             )
-            if not stream or duration <= 0 or duration > duration_cap:
-                raise UserFacingError("缓存 WAV 不符合当前格式要求。")
-            if entry.path.stat().st_size > self.settings.max_wav_size_mb * 1024 * 1024:
-                raise UserFacingError("缓存 WAV 超过当前大小上限。")
+            if (
+                not stream
+                or not math.isfinite(duration)
+                or duration <= 0
+                or duration > duration_cap
+            ):
+                raise ValueError("invalid cached WAV format or duration")
+            wav_size = entry.path.stat().st_size
+            if wav_size > self.settings.max_wav_size_mb * 1024 * 1024:
+                raise ValueError("cached WAV exceeds current size limit")
             entry.media.update(
                 {
                     "duration_seconds": duration,
-                    "wav_size_bytes": entry.path.stat().st_size,
+                    "wav_size_bytes": wav_size,
                     "sample_rate": 16000,
                     "channels": 1,
                     "codec": "pcm_s16le",
@@ -373,12 +418,9 @@ class YouTubeMusicService:
                 }
             )
             return entry
-        except UserFacingError as exc:
-            if isinstance(exc.__cause__, ProcessError):
-                raise
-            await run_blocking(self.audio_cache.invalidate, video_id)
-            return None
-        except (OSError, ValueError, TypeError):
+        except OSError as exc:
+            raise UserFacingError("无法读取歌曲临时音频，请检查任务目录与文件权限。") from exc
+        except (ValueError, TypeError):
             await run_blocking(self.audio_cache.invalidate, video_id)
             return None
 

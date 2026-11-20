@@ -33,6 +33,7 @@
       "pendingDuration": "Pending duration", "unknownDurationTracks": "unknown durations",
       "toAdd": "To add", "skipQueued": "Skip queued", "selectedDuration": "Selected duration",
       "projectedQueue": "Projected queue", "confirmBatch": "Add selected songs to the queue?", "alreadyQueued": "Already queued",
+      "currentTrack": "Current track",
       "confirmResume": "Resume this session queue?",
       "resumeUncertain": "Check the target session and queue first; if the previous submission is uncertain, resuming may send the current item again.",
       "noMatches": "No matching songs", "checkDependencies": "Check dependencies", "runtime": "Runtime",

@@ -33,6 +33,7 @@
       "pendingDuration": "待播总时长", "unknownDurationTracks": "首时长未知",
       "toAdd": "将加入", "skipQueued": "跳过已排队", "selectedDuration": "选中时长",
       "projectedQueue": "预计队列", "confirmBatch": "将选中歌曲加入队列？", "alreadyQueued": "已在队列",
+      "currentTrack": "当前曲目",
       "confirmResume": "继续处理此会话队列？",
       "resumeUncertain": "请先核对目标会话与队列；若上次提交结果未知，继续可能再次发送当前项。",
       "noMatches": "无匹配歌曲", "checkDependencies": "检查依赖", "runtime": "运行状态",

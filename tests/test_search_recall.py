@@ -7,6 +7,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiocqhttp.api_impl import ResultStore
+from aiocqhttp.exceptions import ActionFailed, HttpFailed, NetworkError
 from astrbot.api.platform import AstrBotMessage, MessageMember, MessageType, PlatformMetadata
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
@@ -214,6 +216,63 @@ class RecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.actions("send_group_msg")), 1)
         self.assertFalse(self.manager._records)
         self.assertFalse(self.actions("delete_msg"))
+
+    async def test_actual_onebot_result_store_timeout_is_unknown_and_never_retried(self):
+        sequence = 900000002
+
+        async def lost_receipt(action, **params):
+            self.api.calls.append((action, params))
+            return await ResultStore.fetch(sequence, 0.001)
+
+        self.api.call_action = lost_receipt
+        with patch("core.search_recall.logger") as log:
+            with self.assertRaisesRegex(UserFacingError, "结果未知"):
+                await self.manager.send(qq_event(self.api), self.reply())
+            self.assertIn("NetworkError", str(log.mock_calls))
+        self.assertNotIn(sequence, ResultStore._futures)
+        self.assertEqual(len(self.actions("send_group_msg")), 1)
+        self.assertFalse(self.actions("get_msg"))
+        self.assertFalse(self.actions("delete_msg"))
+        self.assertFalse(self.manager._records)
+        self.assertEqual(self.manager.semaphore._value, 1)
+
+    async def test_transport_errors_are_unknown_without_retries_or_secret_logging(self):
+        for error in (
+            NetworkError("HTTP request failed private token=do-not-log"),
+            ConnectionError("private token=do-not-log"),
+            ConnectionResetError("private token=do-not-log"),
+            BrokenPipeError("private token=do-not-log"),
+            TimeoutError("private token=do-not-log"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.api.call_action = AsyncMock(side_effect=error)
+                with patch("core.search_recall.logger") as log:
+                    with self.assertRaisesRegex(UserFacingError, "结果未知") as caught:
+                        await self.manager.send(qq_event(self.api), self.reply())
+                    self.assertIn("send_unknown", str(log.mock_calls))
+                    self.assertNotIn("do-not-log", str(log.mock_calls))
+                self.assertNotIn("do-not-log", str(caught.exception))
+                self.api.call_action.assert_awaited_once()
+                self.assertFalse(self.manager._records)
+                self.assertEqual(self.manager.semaphore._value, 1)
+
+    async def test_explicit_onebot_rejection_is_failed_not_unknown_and_is_never_retried(self):
+        for error in (
+            ActionFailed({"status": "failed", "retcode": 100, "wording": "token=do-not-log"}),
+            HttpFailed(403),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.api.call_action = AsyncMock(side_effect=error)
+                with patch("core.search_recall.logger") as log:
+                    with self.assertRaisesRegex(UserFacingError, "提交失败") as caught:
+                        await self.manager.send(qq_event(self.api), self.reply())
+                    self.assertIn("send_failed", str(log.mock_calls))
+                    self.assertNotIn("send_unknown", str(log.mock_calls))
+                    self.assertNotIn("do-not-log", str(log.mock_calls))
+                self.assertNotIn("结果未知", str(caught.exception))
+                self.api.call_action.assert_awaited_once()
+                self.assertFalse(self.manager._records)
+                self.assertEqual(self.manager.semaphore._value, 1)
 
     async def test_obsolete_reply_is_rejected_before_capacity_or_network_work(self):
         old = self.reply()
@@ -484,6 +543,18 @@ class PluginRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.plugin._candidates[self.owner]["selectable"])
         self.assertFalse(self.plugin._search_recall._records)
         self.assertEqual(len(self.api.calls), 1)
+
+    async def test_onebot_network_error_invalidates_unseen_candidates_without_resending(self):
+        with patch.object(
+            self.api,
+            "call_action",
+            new=AsyncMock(side_effect=NetworkError("WebSocket API call timeout")),
+        ) as submit:
+            self.assertEqual(len(await self.command("Track")), 1)
+            submit.assert_awaited_once()
+        self.assertFalse(self.plugin._candidates[self.owner]["selectable"])
+        self.assertEqual(self.plugin._candidates[self.owner]["query"], "Track")
+        self.assertFalse(self.plugin._search_recall._records)
 
     async def test_old_send_failure_does_not_invalidate_new_generation(self):
         import test_runtime

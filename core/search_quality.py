@@ -163,6 +163,18 @@ def is_unavailable_live(entry: dict) -> bool:
 
 def _query_spec(query: str) -> tuple[str, list[str], str]:
     query_words = _words(query).split()
+    preferred = _version_kind(query, query=True)
+    if preferred in {"live", "cover", "remix"}:
+        # Only an adjacent version alias makes "version" a modifier, not a song name.
+        query_words = [
+            term
+            for index, term in enumerate(query_words)
+            if not (
+                term == "version"
+                and index > 0
+                and query_words[index - 1] in _VERSION_TERMS[preferred]
+            )
+        ]
     has_official = any(
         term == "official" or term.startswith("\u5b98\u65b9") for term in query_words
     )
@@ -172,7 +184,7 @@ def _query_spec(query: str) -> tuple[str, list[str], str]:
             ignored.update(_VERSION_TERMS[kind])
     # Official format aliases constrain the version, not the artist/title phrase.
     normalized = " ".join(term for term in query_words if term not in ignored)
-    return normalized, list(dict.fromkeys(normalized.split())), _version_kind(query, query=True)
+    return normalized, list(dict.fromkeys(normalized.split())), preferred
 
 
 def _relevance(normalized: str, terms: list[str], preferred: str, song: Song) -> float:
@@ -217,7 +229,7 @@ def search_relevance(query: str, song: Song) -> float:
 
 
 def _recording_identity(song: Song) -> tuple[str, str, str] | None:
-    artist = _words(song.artist)
+    artist = _words(_TOPIC.sub("", _normal(song.artist)))
     if (
         artist in _UNKNOWN_ARTISTS
         or "[\u94fe\u63a5]" in song.artist
